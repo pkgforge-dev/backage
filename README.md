@@ -1,6 +1,6 @@
 <div align="center">
 
-[![logo](src/img/logo-b.webp)](https://github.com/pkgforge-dev/backage)
+[![logo](logo-b.webp)](https://github.com/pkgforge-dev/backage)
 
 # [backage](https://github.com/pkgforge-dev/backage)
 
@@ -26,7 +26,7 @@ Once you've confirmed that the packages you're interested in are found and their
 
 ## The Endpoint
 
-```py
+```prolog
 https://ipitio.github.io/backage/OWNER/REPO/PACKAGE.FORMAT
 ```
 
@@ -104,21 +104,21 @@ They can be queried with the following paths:
 
 You can query a package for its properties, like size or version:
 
-```js
+```jboss-cli
 $.PROPERTY
 ```
 
-```js
+```jboss-cli
 $.size
 ```
 
 Versions may be filtered in and tags out:
 
-```js
+```jboss-cli
 $.version[FILTER].PROPERTY
 ```
 
-```js
+```jboss-cli
 $.version[?(@.latest)].tags[?(@!="latest")]
 ```
 
@@ -130,21 +130,21 @@ $.version[?(@.latest)].tags[?(@!="latest")]
 
 You can query a package for its properties, like size or version:
 
-```py
+```prolog
 /xml/PROPERTY
 ```
 
-```py
+```prolog
 /xml/size
 ```
 
 Versions can be filtered in and tags out:
 
-```py
+```prolog
 /xml/version[FILTER]/PROPERTY
 ```
 
-```py
+```prolog
 /xml/version[./latest[.="true"]]/tags[.!="latest"]
 ```
 
@@ -152,7 +152,7 @@ Versions can be filtered in and tags out:
 
 ### Alternative URL
 
-```py
+```prolog
 https://github.com/pkgforge-dev/backage/raw/index/OWNER/REPO/PACKAGE.FORMAT
 ```
 
@@ -160,7 +160,7 @@ The endpoint is also available at this URL that doesn't rely on Pages.
 
 ## JSON2XML Proxy
 
-```py
+```prolog
 https://ipitio.github.io/backage?json=https://URL/ENCODED/JSON
 ```
 
