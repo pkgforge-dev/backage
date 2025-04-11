@@ -1,1 +1,1 @@
-/^pkgforge(-.*)?//.*//.*-srcbuild(-.*)?
+/^(pkgforge|pkgforge-dev)$//.*//.*-srcbuild(-.*)?
