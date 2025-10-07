@@ -31,6 +31,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Tune dpkg
+        uses: abbbi/github-actions-tune@v1
+
+      - name: Set dpkg
+        run: sudo rm -f /usr/local/bin/dpkg
+
+      - name: Tune apt
+        uses: firebuild/apt-eatmydata-action@v1
+
       - name: Check for release
         id: release
         continue-on-error: true
@@ -40,6 +49,7 @@ jobs:
 
       - name: Fetch all data
         if: ${{ steps.release.outcome == 'success' }}
+        continue-on-error: true
         uses: robinraju/release-downloader@v1
         with:
           latest: true
@@ -52,11 +62,11 @@ jobs:
         run: |
           docker run -v $PWD:/app --env-file <(env | grep GITHUB) \
             ghcr.io/ipitio/backage:master \
-            bash src/test/update.sh; echo "updated=$?" >> "$GITHUB_OUTPUT"
+            src/test/update.sh; echo "updated=$?" >> "$GITHUB_OUTPUT"
 
       - name: Get date
         id: date
-        run: echo "tag=$(date -u +%-Y.%-m).$((($(date -u +%-d)-1)/7))" >> "$GITHUB_OUTPUT"
+        run: echo "tag=$(date -u +%-Y.%-m).$((($(date -u +%-d)-1)/14))" >> "$GITHUB_OUTPUT"
 
       - name: Save database
         if: ${{ steps.update.outputs.updated == '0' }}

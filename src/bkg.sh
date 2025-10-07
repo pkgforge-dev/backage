@@ -1,15 +1,19 @@
 #!/bin/bash
-# shellcheck disable=SC1091,SC2015
+# shellcheck disable=SC1091,SC2015,SC2034
 #
 # Modes:
-# 0 - Update all public (default)
-# 1 - Update own public
-# 2 - Just clean up
-# 3 - Update all public and own private
-# 4 - Update own public and private
-# 5 - Update own private
+# 0 - Update all public pkgs (default)
+# 1 - Update own public pkgs
+# 2 - Just clean the dir
+# 3 - Update all public and own private pkgs
+# 4 - Update own public and private pkgs
+# 5 - Update own private pkgs
 #
-# Usage: source bkg.sh && main [-m <mode>]
+# Duration:
+#  < 0 - Unlimited
+# >= 0 - Run for this many seconds
+#
+# Usage: source bkg.sh && main [-d <duration>] [-m <mode>]
 
 source lib/owner.sh
 
@@ -25,11 +29,15 @@ main() {
     local return_code=0
     local opted_out
     local opted_out_before
+    local len_conn
     connections=$(mktemp) || exit 1
     temp_connections=$(mktemp) || exit 1
 
-    while getopts "m:" flag; do
+    while getopts "d:m:" flag; do
         case ${flag} in
+        d)
+            BKG_MAX_LEN=$((OPTARG))
+            ;;
         m)
             BKG_MODE=$((OPTARG))
             ;;
@@ -120,14 +128,13 @@ main() {
                     cat "$temp_connections" >>"$connections"
 
                     sed -i 's/^[[:space:]]*//;s/[[:space:]]*$//; /^$/d; /^0\/$/d' "$connections"
-                    [[ "$(wc -l <"$BKG_OWNERS")" -ge $(($(sort -u "$connections" | wc -l) + 100)) ]] || seq 1 2 | env_parallel --lb --halt soon,fail=1 page_owner
+                    # shellcheck disable=SC2319
+                    BKG_PAGE_ALL=$( (($(wc -l <"$BKG_OWNERS") < $(($(sort -u "$connections" | wc -l) + 100)))); echo "$?")
+                    seq 1 2 | env_parallel --lb --halt soon,fail=1 page_owner
                 else
                     get_membership "$GITHUB_OWNER" >"$connections"
-                    curl "https://raw.githubusercontent.com/ipitio/backage/refs/heads/$GITHUB_BRANCH/optout.txt" > base_out
-                    curl "https://raw.githubusercontent.com/ipitio/backage/refs/heads/$GITHUB_BRANCH/owners.txt" > base_own
-                    ! diff -q "$BKG_OWNERS" base_own || : > "$BKG_OWNERS"
-                    ! diff -q "$BKG_OPTOUT" base_out || : > "$BKG_OPTOUT"
-                    rm -f base_out base_own
+                    [ "$BKG_IS_FIRST" = "false" ] || : > "$BKG_OWNERS"
+                    [ "$BKG_IS_FIRST" = "false" ] || : > "$BKG_OPTOUT"
                 fi
 
                 sort "$connections" | uniq -c | sort -nr | awk '{print $2}' >"$connections".bak
@@ -177,9 +184,10 @@ main() {
 
                 rm -f all_owners_in_db all_owners_tu
                 clean_owners "$BKG_OWNERS"
-                head -n $(($(wc -l <"$connections") + 2)) "$BKG_OWNERS" | env_parallel --lb save_owner
+                len_conn=$(wc -l <"$connections")
+                head -n $(( len_conn < 100 ? len_conn + 100 : len_conn * 3 / 2 )) "$BKG_OWNERS" | env_parallel --lb save_owner
                 awk -F'|' '{print $1"/"$2}' packages_to_update | sort -uR 2>/dev/null | head -n1000 | env_parallel --lb save_owner
-                parallel "sed -i '\,^{}$,d' $BKG_OWNERS" <"$connections"
+                parallel "sed -i '\,^{}$,d' $BKG_OWNERS" ::: "$(sed 's/"/\\"/g' "$connections")"
                 sed -i '/^0\//d' "$BKG_OWNERS"
                 set_BKG BKG_DIFF "$db_size_curr"
             fi

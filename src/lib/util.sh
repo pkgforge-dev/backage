@@ -9,15 +9,16 @@
 set -o allexport
 
 sudonot() {
+    # shellcheck disable=SC2068
     if command -v sudo >/dev/null; then
-        sudo "$@"
+        sudo -E "${@:-:}" || "${@:-:}"
     else
-        "$@"
+        "${@:-:}"
     fi
 }
 
 apt_install() {
-    if ! dpkg -l "$@" >/dev/null 2>&1; then
+    if ! dpkg -s "$@" &>/dev/null; then
         apt-get update
         sudonot apt-get install -yqq "$@"
     fi
@@ -47,6 +48,9 @@ BKG_INDEX_TBL_OWN=owners
 BKG_INDEX_TBL_PKG=packages
 BKG_INDEX_TBL_VER=versions
 BKG_MODE=0
+BKG_MAX_LEN=16200
+BKG_IS_FIRST=false
+BKG_PAGE_ALL=1
 
 # format numbers like 1000 to 1k
 numfmt() {
@@ -139,6 +143,7 @@ del_BKG() {
 }
 
 save_and_exit() {
+    ((BKG_MAX_LEN > 0)) || return
     local to
     to=$(get_BKG BKG_TIMEOUT)
 
@@ -161,7 +166,6 @@ check_limit() {
     local minute_calls
     local sec_limit_diff
     local min_passed
-    local max_len=${1:-14400}
     local rate_limit_start
     rate_limit_end=$(date -u +%s)
     [ -n "$BKG_SCRIPT_START" ] && rate_limit_start="$BKG_SCRIPT_START" || {
@@ -169,7 +173,7 @@ check_limit() {
         [ -n "$rate_limit_start" ] || echo "BKG_SCRIPT_START empty!"
     }
     script_limit_diff=$((rate_limit_end - rate_limit_start))
-    ((script_limit_diff < max_len)) || save_and_exit
+    ((script_limit_diff < BKG_MAX_LEN)) || save_and_exit
     (($? != 3)) || return 3
     total_calls=$(get_BKG BKG_CALLS_TO_API)
     rate_limit_start=$(get_BKG BKG_RATE_LIMIT_START)
@@ -180,7 +184,7 @@ check_limit() {
     if ((total_calls >= 1000 * (hours_passed + 1))); then
         echo "$total_calls calls to the GitHub API in $((rate_limit_diff / 60)) minutes"
         remaining_time=$((3600 * (hours_passed + 1) - rate_limit_diff))
-        ((remaining_time < max_len - script_limit_diff)) || save_and_exit
+        ((remaining_time < BKG_MAX_LEN - script_limit_diff)) || save_and_exit
         (($? != 3)) || return 3
         echo "Sleeping for $remaining_time seconds..."
         sleep $remaining_time
@@ -199,7 +203,7 @@ check_limit() {
     if ((minute_calls >= 900 * (min_passed + 1))); then
         echo "$minute_calls calls to the GitHub API in $sec_limit_diff seconds"
         remaining_time=$((60 * (min_passed + 1) - sec_limit_diff))
-        ((remaining_time < max_len - script_limit_diff)) || save_and_exit
+        ((remaining_time < BKG_MAX_LEN - script_limit_diff)) || save_and_exit
         (($? != 3)) || return 3
         echo "Sleeping for $remaining_time seconds..."
         sleep $remaining_time
@@ -217,7 +221,7 @@ curl() {
     local result
 
     while [ "$i" -lt "$max_attempts" ]; do
-        result=$(command curl -sSLNZ --connect-timeout 60 -m 120 "$@" 2>/dev/null)
+        result=$(command curl -sSLNZ --connect-timeout 60 -m 120 --retry 5 --retry-delay 1 --retry-all-errors "$@" 2>/dev/null)
         [ -n "$result" ] && echo "$result" && return 0
         check_limit || return $?
         sleep "$wait_time"
@@ -235,12 +239,23 @@ run_parallel() {
     exit_code=$(mktemp)
 
     if [ "$(wc -l <<<"$2")" -gt 1 ]; then
-        ( # parallel --lb --halt soon,fail=1
+        ( # parallel --lb --halt soon,fail=1 -j "$max_jobs"
+            local active=0
+            local max_jobs
+            max_jobs=$(nproc --all)
+
             for i in $2; do
                 code=$(cat "$exit_code")
                 ! grep -q "3" <<<"$code" || exit
                 ! grep -q "2" <<<"$code" || break
+
+                while [ "$active" -ge "$max_jobs" ]; do
+                    wait -n
+                    ((active--))
+                done
+
                 ("$1" "$i" || echo "$?" >>"$exit_code") &
+                ((active++))
             done
 
             wait
@@ -263,6 +278,7 @@ _jq() {
 dldb() {
     local latest=${1:-$(curl "https://github.com/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/latest" | grep -oP "href=\"/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/tag/[^\"]+" | cut -d'/' -f6)}
     [[ "$(curl -o /dev/null --silent -Iw '%{http_code}' "https://github.com/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/download/$latest/index.sql.zst")" != "404" ]] || return 1
+    [ -z "$2" ] || return 0
     echo "Downloading the latest database..."
     # `cd src ; source bkg.sh && dldb` to dl the latest db
     [ ! -f "$BKG_INDEX_DB" ] || mv "$BKG_INDEX_DB" "$BKG_INDEX_DB".bak
@@ -299,13 +315,13 @@ query_api() {
     echo "$res"
 }
 
-get_db() {
+check_db() {
     local release
     local latest
     release=$(query_api "repos/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/latest")
     latest=$(jq -r '.tag_name' <<<"$release")
 
-    until dldb "$latest"; do
+    until dldb "$latest" 1; do
         echo "Deleting the latest release..."
         curl_gh -X DELETE "https://api.github.com/repos/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/$(jq -r '.id' <<<"$release")"
         release=$(query_api "repos/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/latest")
@@ -426,7 +442,7 @@ ytoy() {
     yq -oy "$1" | sed 's/"/\\"/g' >"${1%.*}.yml"
 }
 
-clean_owners(){
+clean_owners() {
     local temp_file
     temp_file=$(mktemp)
     echo >>"$1"
