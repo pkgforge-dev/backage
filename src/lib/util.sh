@@ -401,6 +401,8 @@ curl_orgs() {
 
 explore() {
     local node=$1
+	local is_user=false
+	local got_orgs=false
     [[ "$node" =~ .*\/.* ]] && local graph=("stargazers" "watchers" "forks") || local graph=("followers" "following" "people")
     [ -z "$2" ] || graph=("$2")
 
@@ -412,12 +414,19 @@ explore() {
             if [[ "$node" =~ .*\/.* ]]; then
                 nodes=$(curl_users "$node/$edge?page=$page") # repo
             else
-                nodes=$(curl_users "orgs/$node/$edge?page=$page") # org
+				if [ "$is_user" = false ]; then
+                	nodes=$(curl_users "orgs/$node/$edge?page=$page") # org
+					[ -n "$nodes" ] || is_user=true
+				fi
 
-                if [ -z "$nodes" ]; then
-                    nodes=$(curl_users "$node?tab=$edge&page=$page") # user
-                    curl_orgs "$1"
-                fi
+				if [ "$is_user" = true ]; then
+					nodes=$(curl_users "$node?tab=$edge&page=$page") # user
+
+					if [ "$got_orgs" = false ]; then
+						curl_orgs "$node"
+						got_orgs=true
+					fi
+				fi
             fi
 
             grep -v "$(cut -d'/' -f1 <<<"$node")" <<<"$nodes"
@@ -444,62 +453,92 @@ ytox() {
 }
 
 ytoxt() {
-    # ytox + trim if the json or xml is over 50MB, remove oldest versions
-    while [ -f "$1" ] && [[ "$(ytox "$1")" -ge 50000000 || "$(stat -c %s "$1")" -ge 50000000 ]]; do
-        if jq -e '
-			if type == "array" then
-			any(.[]; (.version // []) | length > 0)
-			else
-			(.version // []) | length > 0
-			end
-		' "$1" >/dev/null; then
-            jq -c '
-				def trim_versions:
-					if (.version // []) | length > 0 then
-						.version |= (
-							sort_by(.id | (if type == "string" and test("^-?[0-9]+$") then tonumber else . end))
-							| del(.[0])
-						)
-					else
-						.
-					end;
-				if type == "array" then
-					(to_entries
-					| (max_by((.value.version // []) | length) // empty) as $max
-					| map(
-						if .key == $max.key and ((.value.version // []) | length > 0)
-						then (.value |= trim_versions)
-						else .
-						end
-					)
-					| map(.value))
-				else
-					trim_versions
-				end
-			' "$1" >"$1".tmp
-		else
-			jq -c '
-				if type == "array" then
-					(
-						def to_num:
-							if type == "number" then .
-							elif type == "string" then tonumber? // 0
-							else 0 end;
-						to_entries
-						| (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
-						| if $target == null then
-							map(.value)
-						else
-							[ .[] | select(.key != $target.key) | .value ]
-						end
-					)
-				else
-					.
-				end
-				' "$1" >"$1".tmp
+    # ytox + trim: if the json or xml is over 50MB, remove oldest versions
+    local f="$1"
+    local tmp
+
+    [ -f "$f" ] || return 1
+
+    tmp=$(mktemp "${f}.XXXXXX") || return 1
+    trap 'rm -f "$tmp"' RETURN
+
+    while [ -f "$f" ]; do
+        local json_size
+        local xml_size
+
+        json_size=$(stat -c %s "$f" 2>/dev/null || echo -1)
+
+        if [ "$json_size" -lt 50000000 ]; then
+            # Only generate/check XML if JSON is already under limit.
+            xml_size=$(ytox "$f" 2>/dev/null || echo -1)
+            [ "$xml_size" -ge 50000000 ] || break
         fi
-        mv "$1".tmp "$1"
+
+        if jq -e '
+            if type == "array" then
+                any(.[]; ((.version // []) | type == "array") and ((.version // []) | length > 0))
+            else
+                ((.version // []) | type == "array") and ((.version // []) | length > 0)
+            end
+        ' "$f" >/dev/null; then
+            jq -c '
+                def id_to_num:
+                    if type == "number" then .
+                    elif type == "string" then tonumber? // 0
+                    else 0 end;
+                def trim_versions:
+                    if ((.version // []) | type == "array") and ((.version // []) | length > 0) then
+                        ((.version
+                            | to_entries
+                            | min_by(.value.id | id_to_num)
+                            | .key) // empty) as $idx
+                        | if ($idx | tostring) == "" then .
+                          else .version |= del(.[ $idx ])
+                          end
+                    else
+                        .
+                    end;
+                if type == "array" then
+                    (to_entries
+                    | (max_by((.value.version // []) | length) // empty) as $max
+                    | map(
+                        if .key == $max.key and (((.value.version // []) | type == "array") and ((.value.version // []) | length > 0))
+                        then (.value |= trim_versions)
+                        else .
+                        end
+                    )
+                    | map(.value))
+                else
+                    trim_versions
+                end
+            ' "$f" >"$tmp"
+        else
+            jq -c '
+                if type == "array" then
+                    (
+                        def to_num:
+                            if type == "number" then .
+                            elif type == "string" then tonumber? // 0
+                            else 0 end;
+                        to_entries
+                        | (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
+                        | if $target == null then
+                            map(.value)
+                        else
+                            [ .[] | select(.key != $target.key) | .value ]
+                        end
+                    )
+                else
+                    .
+                end
+                ' "$f" >"$tmp"
+        fi
+
+        mv "$tmp" "$f"
     done
+
+    # Ensure the XML output corresponds to the final JSON.
+    ytox "$f" >/dev/null 2>&1
 }
 
 ytoy() {
