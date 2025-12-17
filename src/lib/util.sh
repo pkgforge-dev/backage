@@ -456,6 +456,9 @@ ytoxt() {
     # ytox + trim: if the json or xml is over 50MB, remove oldest versions
     local f="$1"
     local tmp
+    local del_n=1
+    local last_json_size=-1
+    local last_xml_size=-1
 
     [ -f "$f" ] || return 1
 
@@ -468,10 +471,31 @@ ytoxt() {
 
         json_size=$(stat -c %s "$f" 2>/dev/null || echo -1)
 
+        # Stop if we can't shrink anymore.
+        if [ "$json_size" -eq "$last_json_size" ] && [ "$last_json_size" -ge 0 ]; then
+            break
+        fi
+        last_json_size="$json_size"
+
         if [ "$json_size" -lt 50000000 ]; then
             # Only generate/check XML if JSON is already under limit.
             xml_size=$(ytox "$f" 2>/dev/null || echo -1)
-            [ "$xml_size" -ge 50000000 ] || break
+            if [ "$xml_size" -lt 50000000 ]; then
+                break
+            fi
+
+            # If XML is still too large, keep trimming, but avoid redoing work forever.
+            if [ "$xml_size" -eq "$last_xml_size" ] && [ "$last_xml_size" -ge 0 ]; then
+                break
+            fi
+            last_xml_size="$xml_size"
+        else
+            # JSON is still too large: increase trimming aggressiveness.
+            if [ "$json_size" -ge 50000000 ]; then
+                if [ "$del_n" -lt 65536 ]; then
+                    del_n=$((del_n * 2))
+                fi
+            fi
         fi
 
         if jq -e '
@@ -486,15 +510,14 @@ ytoxt() {
                     if type == "number" then .
                     elif type == "string" then tonumber? // 0
                     else 0 end;
-                def trim_versions:
+                def trim_versions($n):
                     if ((.version // []) | type == "array") and ((.version // []) | length > 0) then
-                        ((.version
-                            | to_entries
-                            | min_by(.value.id | id_to_num)
-                            | .key) // empty) as $idx
-                        | if ($idx | tostring) == "" then .
-                          else .version |= del(.[ $idx ])
-                          end
+                        (
+                            .version
+                            | sort_by(.id | id_to_num)
+                            | .[$n:]
+                        ) as $v
+                        | .version = $v
                     else
                         .
                     end;
@@ -503,15 +526,15 @@ ytoxt() {
                     | (max_by((.value.version // []) | length) // empty) as $max
                     | map(
                         if .key == $max.key and (((.value.version // []) | type == "array") and ((.value.version // []) | length > 0))
-                        then (.value |= trim_versions)
+                        then (.value |= trim_versions($n))
                         else .
                         end
                     )
                     | map(.value))
                 else
-                    trim_versions
+                    trim_versions($n)
                 end
-            ' "$f" >"$tmp"
+            ' --argjson n "$del_n" "$f" >"$tmp"
         else
             jq -c '
                 if type == "array" then
@@ -539,6 +562,10 @@ ytoxt() {
 
     # Ensure the XML output corresponds to the final JSON.
     ytox "$f" >/dev/null 2>&1
+
+	# If either JSON or XML is > 100MB, delete each one that is too large.
+	[ "$(stat -c %s "$f" 2>/dev/null || echo -1)" -lt 100000000 ] || rm -f "$f"
+	[ "$(stat -c %s "${f%.*}.xml" 2>/dev/null || echo -1)" -lt 100000000 ] || rm -f "${f%.*}.xml"
 }
 
 ytoy() {
