@@ -457,7 +457,6 @@ ytoxt() {
     local f="$1"
     local tmp
     local del_n=1
-    local last_json_size=-1
     local last_xml_size=-1
 
     [ -f "$f" ] || return 1
@@ -468,18 +467,16 @@ ytoxt() {
     while [ -f "$f" ]; do
         local json_size
         local xml_size
+        local tmp_size
 
         json_size=$(stat -c %s "$f" 2>/dev/null || echo -1)
-
-        # Stop if we can't shrink anymore.
-        if [ "$json_size" -eq "$last_json_size" ] && [ "$last_json_size" -ge 0 ]; then
-            break
-        fi
-        last_json_size="$json_size"
 
         if [ "$json_size" -lt 50000000 ]; then
             # Only generate/check XML if JSON is already under limit.
             xml_size=$(ytox "$f" 2>/dev/null || echo -1)
+            # If XML size can't be determined, treat it as oversized so we keep trimming.
+            [ "$xml_size" -ge 0 ] || xml_size=50000000
+
             if [ "$xml_size" -lt 50000000 ]; then
                 break
             fi
@@ -489,6 +486,11 @@ ytoxt() {
                 break
             fi
             last_xml_size="$xml_size"
+
+            # XML still too large: increase trimming aggressiveness as well.
+            if [ "$del_n" -lt 65536 ]; then
+                del_n=$((del_n * 2))
+            fi
         else
             # JSON is still too large: increase trimming aggressiveness.
             if [ "$json_size" -ge 50000000 ]; then
@@ -499,7 +501,7 @@ ytoxt() {
         fi
 
         if jq -e '
-            if type == "array" then
+            if (type == "array") or (type == "object") then
                 any(.[]; ((.version // []) | type == "array") and ((.version // []) | length > 0))
             else
                 ((.version // []) | type == "array") and ((.version // []) | length > 0)
@@ -510,6 +512,8 @@ ytoxt() {
                     if type == "number" then .
                     elif type == "string" then tonumber? // 0
                     else 0 end;
+                def vlen:
+                    (.version // []) | if type == "array" then length else 0 end;
                 def trim_versions($n):
                     if ((.version // []) | type == "array") and ((.version // []) | length > 0) then
                         (
@@ -523,14 +527,24 @@ ytoxt() {
                     end;
                 if type == "array" then
                     (to_entries
-                    | (max_by((.value.version // []) | length) // empty) as $max
+                    | (max_by(.value | vlen) // empty) as $max
                     | map(
-                        if .key == $max.key and (((.value.version // []) | type == "array") and ((.value.version // []) | length > 0))
+                        if .key == $max.key and ((.value | vlen) > 0)
                         then (.value |= trim_versions($n))
                         else .
                         end
                     )
                     | map(.value))
+                elif type == "object" then
+                    (to_entries
+                    | (max_by(.value | vlen) // empty) as $max
+                    | map(
+                        if .key == $max.key and ((.value | vlen) > 0)
+                        then (.value |= trim_versions($n))
+                        else .
+                        end
+                    )
+                    | from_entries)
                 else
                     trim_versions($n)
                 end
@@ -551,10 +565,77 @@ ytoxt() {
                             [ .[] | select(.key != $target.key) | .value ]
                         end
                     )
+                elif type == "object" then
+                    (
+                        def to_num:
+                            if type == "number" then .
+                            elif type == "string" then tonumber? // 0
+                            else 0 end;
+                        to_entries
+                        | (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
+                        | if $target == null then
+                            from_entries
+                        else
+                            ([ .[] | select(.key != $target.key) ] | from_entries)
+                        end
+                    )
                 else
                     .
                 end
                 ' "$f" >"$tmp"
+        fi
+
+        tmp_size=$(stat -c %s "$tmp" 2>/dev/null || echo -1)
+
+        # If trimming didn't reduce size, retry with more aggressive deletion instead of stalling.
+        if [ "$json_size" -ge 0 ] && [ "$tmp_size" -ge 0 ] && [ "$tmp_size" -ge "$json_size" ]; then
+            rm -f "$tmp"
+
+            if [ "$del_n" -lt 65536 ]; then
+                del_n=$((del_n * 2))
+                continue
+            fi
+
+            # If we're already at max aggressiveness, fall back to trimming whole packages once.
+            jq -c '
+                if type == "array" then
+                    (
+                        def to_num:
+                            if type == "number" then .
+                            elif type == "string" then tonumber? // 0
+                            else 0 end;
+                        to_entries
+                        | (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
+                        | if $target == null then
+                            map(.value)
+                        else
+                            [ .[] | select(.key != $target.key) | .value ]
+                        end
+                    )
+                elif type == "object" then
+                    (
+                        def to_num:
+                            if type == "number" then .
+                            elif type == "string" then tonumber? // 0
+                            else 0 end;
+                        to_entries
+                        | (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
+                        | if $target == null then
+                            from_entries
+                        else
+                            ([ .[] | select(.key != $target.key) ] | from_entries)
+                        end
+                    )
+                else
+                    .
+                end
+            ' "$f" >"$tmp"
+
+            tmp_size=$(stat -c %s "$tmp" 2>/dev/null || echo -1)
+            if [ "$json_size" -ge 0 ] && [ "$tmp_size" -ge 0 ] && [ "$tmp_size" -ge "$json_size" ]; then
+                rm -f "$tmp"
+                break
+            fi
         fi
 
         mv "$tmp" "$f"
