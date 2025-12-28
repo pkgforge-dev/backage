@@ -124,16 +124,32 @@ update_owner() {
         find "$BKG_INDEX_DIR/$owner" -type f -name '*.json' ! -name '.*' -print0 | xargs -0 jq -cs '[.] | add' >"$BKG_INDEX_DIR/$owner/.json.tmp"
         jq -cs '{ ("package"): . }' "$BKG_INDEX_DIR/$owner/.json.tmp" >"$BKG_INDEX_DIR/$owner/.json"
         ytoxt "$BKG_INDEX_DIR/$owner/.json"
-		jq -c '.package[]' "$BKG_INDEX_DIR/$owner/.json" >"$BKG_INDEX_DIR/$owner/.json.tmp"
-        mv -f "$BKG_INDEX_DIR/$owner/.json.tmp" "$BKG_INDEX_DIR/$owner/.json"
+
+		# if .package exists, split it into array
+		if jq -e '.package' "$BKG_INDEX_DIR/$owner/.json" &>/dev/null; then
+			jq -c '.package[]' "$BKG_INDEX_DIR/$owner/.json" >"$BKG_INDEX_DIR/$owner/.json.tmp"
+        	mv -f "$BKG_INDEX_DIR/$owner/.json.tmp" "$BKG_INDEX_DIR/$owner/.json"
+		fi
 
         echo "Creating $owner repo arrays..."
-        parallel "jq -c --arg repo {} '[.[] | select(.repo == \$repo)]' \"$BKG_INDEX_DIR/$owner/.json\" > \"$BKG_INDEX_DIR/$owner/{}/.json.tmp\"" <<<"$owner_repos"
-        xargs -I {} bash -c "jq -cs '{ (\"package\"): . }' \"$BKG_INDEX_DIR/$owner/{}/.json.tmp\" > \"$BKG_INDEX_DIR/$owner/{}/.json\"" <<<"$owner_repos"
-        xargs -I {} bash -c "ytoxt \"$BKG_INDEX_DIR/$owner/{}/.json\"" <<<"$owner_repos"
-		xargs -I {} bash -c "jq -c '.package[]' \"$BKG_INDEX_DIR/$owner/{}/.json\" > \"$BKG_INDEX_DIR/$owner/{}/.json.tmp\"" <<<"$owner_repos"
-        xargs -I {} mv -f "$BKG_INDEX_DIR/$owner/{}/.json.tmp" "$BKG_INDEX_DIR/$owner/{}/.json" <<<"$owner_repos"
-    fi
+		# shellcheck disable=SC2086,SC2016
+		parallel '
+			repo={}
+			repo_dir="$BKG_INDEX_DIR/'"$owner"'/$repo"
+			src="$BKG_INDEX_DIR/'"$owner"'/.json"
+			tmp="$repo_dir/.json.tmp"
+			dst="$repo_dir/.json"
+
+			jq -c --arg repo "$repo" '"'"'[.[] | select(.repo == $repo)]'"'"' "$src" >"$tmp" &&
+			jq -cs '"'"'{ ("package"): . }'"'"' "$tmp" >"$dst" &&
+			ytoxt "$dst"
+			if jq -e '"'"'.package'"'"' "$dst" &>/dev/null; then
+				jq -c '"'"'.package[]'"'"' "$dst" >"$tmp"
+				mv -f "$tmp" "$dst"
+			fi
+		' ::: $owner_repos
+
+	fi
 
     sed -i '/^\(.*\/\)*'"$owner"'$/d' "$BKG_OWNERS"
     echo "Updated $owner"
