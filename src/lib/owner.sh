@@ -148,7 +148,6 @@ update_owner() {
 				mv -f "$tmp" "$dst"
 			fi
 		' ::: $owner_repos
-
 	fi
 
     sed -i '/^\(.*\/\)*'"$owner"'$/d' "$BKG_OWNERS"
