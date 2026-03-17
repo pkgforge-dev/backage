@@ -39,16 +39,10 @@ source $(which env_parallel.bash)
 env_parallel --session
 GITHUB_OWNER=${GITHUB_OWNER:-ipitio}
 GITHUB_REPO=${GITHUB_REPO:-backage}
-BKG_ROOT=..
+BKG_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"/../..
 BKG_ENV=env.env
 BKG_OWNERS=$BKG_ROOT/owners.txt
 BKG_OPTOUT=$BKG_ROOT/optout.txt
-BKG_BRANCH=$(git branch --show-current 2>/dev/null)
-[ -n "$GITHUB_BRANCH" ] || GITHUB_BRANCH="$BKG_BRANCH"
-BKG_INDEX="index$([ "$GITHUB_BRANCH" = "master" ] && echo "" || echo "-${BKG_BRANCH:-}")"
-BKG_INDEX_DB=$BKG_ROOT/"$BKG_INDEX".db
-BKG_INDEX_SQL=$BKG_ROOT/"$BKG_INDEX".sql
-BKG_INDEX_DIR=$BKG_ROOT/"$BKG_INDEX"
 BKG_INDEX_TBL_OWN=owners
 BKG_INDEX_TBL_PKG=packages
 BKG_INDEX_TBL_VER=versions
@@ -98,7 +92,7 @@ PRAGMA cache_size = -500000;
 
 get_BKG() {
     [ -f "$BKG_ENV" ] || return
-    while [ -f "$BKG_ENV.lock" ]; do :; done
+    while [ -f "$BKG_ENV.lock" ]; do sleep 0.05; done
     grep "^$1=" "$BKG_ENV" | cut -d'=' -f2
 }
 
@@ -108,7 +102,7 @@ set_BKG() {
     value=$(echo "$2" | perl -pe 'chomp if eof')
     tmp_file=$(mktemp)
     [ -f "$BKG_ENV" ] || return
-    until ln "$BKG_ENV" "$BKG_ENV.lock" 2>/dev/null; do :; done
+    until ln "$BKG_ENV" "$BKG_ENV.lock" 2>/dev/null; do sleep 0.05; done
 
     if ! grep -q "^$1=" "$BKG_ENV"; then
         echo "$1=$value" >>"$BKG_ENV"
@@ -129,19 +123,26 @@ get_BKG_set() {
 
 set_BKG_set() {
     local list
+    local list_escaped
     local code=0
-    until ln "$BKG_ENV" "$BKG_ENV.$1.lock" 2>/dev/null; do :; done
-    list=$(get_BKG_set "$1" | awk '!seen[$0]++' | perl -pe 's/\n/\\n/g')
-    # shellcheck disable=SC2076
-    [[ "$list" =~ "$2" ]] && code=1 || list="${list:+$list\n}$2"
-    set_BKG "$1" "$(echo "$list" | perl -pe 's/\\n/\n/g' | perl -pe 's/\n/\\n/g' | perl -pe 's/^\\n//')"
+    until ln "$BKG_ENV" "$BKG_ENV.$1.lock" 2>/dev/null; do sleep 0.05; done
+    list=$(get_BKG_set "$1" | awk '!seen[$0]++')
+
+    if awk -v item="$2" '$0 == item { found = 1; exit } END { exit !found }' <<<"$list"; then
+        code=1
+    else
+        list="${list:+$list$'\n'}$2"
+    fi
+
+    list_escaped=$(perl -pe 's/\n/\\n/g; s/^\\n//' <<<"$list")
+    set_BKG "$1" "$list_escaped"
     rm -f "$BKG_ENV.$1.lock"
     return $code
 }
 
 del_BKG() {
     [ -f "$BKG_ENV" ] || return
-    until ln "$BKG_ENV" "$BKG_ENV.lock" 2>/dev/null; do :; done
+    until ln "$BKG_ENV" "$BKG_ENV.lock" 2>/dev/null; do sleep 0.05; done
     sed -i "/^$1=/d;/^\s*$/d" "$BKG_ENV"
     echo >>"$BKG_ENV"
     rm -f "$BKG_ENV.lock"
@@ -300,8 +301,8 @@ dldb() {
         echo "Failed to get the latest database"
     fi
 
-    [ -f "$BKG_ROOT/.gitignore" ] || echo "index.db*" >>$BKG_ROOT/.gitignore
-    grep -q "index.db" "$BKG_ROOT/.gitignore" || echo "index.db*" >>$BKG_ROOT/.gitignore
+    [ -f "$BKG_ROOT/.gitignore" ] || echo "*.db*" >>$BKG_ROOT/.gitignore
+    grep -q "\*.db" "$BKG_ROOT/.gitignore" || echo "*.db*" >>$BKG_ROOT/.gitignore
 }
 
 curl_gh() {
@@ -330,7 +331,7 @@ check_db() {
     release=$(query_api "repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest")
     latest=$(jq -r '.tag_name' <<<"$release")
 
-    until dldb "$latest" 1; do
+    until dldb "$latest" "1"; do
         echo "Deleting the latest release..."
         curl_gh -X DELETE "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/$(jq -r '.id' <<<"$release")"
         release=$(query_api "repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest")
@@ -406,9 +407,11 @@ curl_orgs() {
 
 explore() {
     local node=$1
+	local is_repo=false
 	local is_user=false
 	local got_orgs=false
-    [[ "$node" =~ .*\/.* ]] && local graph=("stargazers" "watchers" "forks") || local graph=("followers" "following" "people")
+	[[ "$node" =~ .*\/.* ]] && is_repo=true || is_user=true
+    [ "$is_repo" = true ] && local graph=("stargazers" "watchers" "forks" "collaborators") || local graph=("followers" "following" "people")
     [ -z "$2" ] || graph=("$2")
 
     for edge in "${graph[@]}"; do
@@ -416,8 +419,8 @@ explore() {
         while true; do
             local nodes
 
-            if [[ "$node" =~ .*\/.* ]]; then
-                nodes=$(curl_users "$node/$edge?page=$page") # repo
+            if [ "$is_repo" = true ]; then
+				[ "$edge" = "collaborators" ] && nodes=$(query_api "repos/$node/collaborators?per_page=100&page=$page" | jq -r '.[] | select(.id and .login) | "\(.id)/\(.login)"' 2>/dev/null) || nodes=$(curl_users "$node/$edge?page=$page")
             else
 				if [ "$is_user" = false ]; then
                 	nodes=$(curl_users "orgs/$node/$edge?page=$page") # org
@@ -435,7 +438,7 @@ explore() {
             fi
 
             grep -v "$(cut -d'/' -f1 <<<"$node")" <<<"$nodes"
-            [[ "$(wc -l <<<"$nodes")" -ge 15 ]] || break
+            [[ "$(wc -l <<<"$nodes")" -ge $([ "$edge" = "collaborators" ] && echo 100 || echo 15) ]] || break
             ((page++))
         done
     done
@@ -457,203 +460,6 @@ ytox() {
 	stat -c %s "${1%.*}.xml" || echo -1
 }
 
-ytoxt() {
-    # ytox + trim: if the json or xml is over 50MB, remove oldest versions
-    local f="$1"
-    local tmp
-    local del_n=1
-    local last_xml_size=-1
-
-    [ -f "$f" ] || return 1
-
-    tmp=$(mktemp "${f}.XXXXXX") || return 1
-    trap 'rm -f "$tmp"' RETURN
-
-    while [ -f "$f" ]; do
-        local json_size
-        local xml_size
-        local tmp_size
-
-        json_size=$(stat -c %s "$f" 2>/dev/null || echo -1)
-
-        if [ "$json_size" -lt 50000000 ]; then
-            # Only generate/check XML if JSON is already under limit.
-            xml_size=$(ytox "$f" 2>/dev/null || echo -1)
-            # If XML size can't be determined, treat it as oversized so we keep trimming.
-            [ "$xml_size" -ge 0 ] || xml_size=50000000
-
-            if [ "$xml_size" -lt 50000000 ]; then
-                break
-            fi
-
-            # If XML is still too large, keep trimming, but avoid redoing work forever.
-            if [ "$xml_size" -eq "$last_xml_size" ] && [ "$last_xml_size" -ge 0 ]; then
-                break
-            fi
-            last_xml_size="$xml_size"
-
-            # XML still too large: increase trimming aggressiveness as well.
-            if [ "$del_n" -lt 65536 ]; then
-                del_n=$((del_n * 2))
-            fi
-        else
-            # JSON is still too large: increase trimming aggressiveness.
-            if [ "$json_size" -ge 50000000 ]; then
-                if [ "$del_n" -lt 65536 ]; then
-                    del_n=$((del_n * 2))
-                fi
-            fi
-        fi
-
-        if jq -e '
-            if (type == "array") or (type == "object") then
-                any(.[]; ((.version // []) | type == "array") and ((.version // []) | length > 0))
-            else
-                ((.version // []) | type == "array") and ((.version // []) | length > 0)
-            end
-        ' "$f" >/dev/null; then
-            jq -c '
-                def id_to_num:
-                    if type == "number" then .
-                    elif type == "string" then tonumber? // 0
-                    else 0 end;
-                def vlen:
-                    (.version // []) | if type == "array" then length else 0 end;
-                def trim_versions($n):
-                    if ((.version // []) | type == "array") and ((.version // []) | length > 0) then
-                        (
-                            .version
-                            | sort_by(.id | id_to_num)
-                            | .[$n:]
-                        ) as $v
-                        | .version = $v
-                    else
-                        .
-                    end;
-                if type == "array" then
-                    (to_entries
-                    | (max_by(.value | vlen) // empty) as $max
-                    | map(
-                        if .key == $max.key and ((.value | vlen) > 0)
-                        then (.value |= trim_versions($n))
-                        else .
-                        end
-                    )
-                    | map(.value))
-                elif type == "object" then
-                    (to_entries
-                    | (max_by(.value | vlen) // empty) as $max
-                    | map(
-                        if .key == $max.key and ((.value | vlen) > 0)
-                        then (.value |= trim_versions($n))
-                        else .
-                        end
-                    )
-                    | from_entries)
-                else
-                    trim_versions($n)
-                end
-            ' --argjson n "$del_n" "$f" >"$tmp"
-        else
-            jq -c '
-                if type == "array" then
-                    (
-                        def to_num:
-                            if type == "number" then .
-                            elif type == "string" then tonumber? // 0
-                            else 0 end;
-                        to_entries
-                        | (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
-                        | if $target == null then
-                            map(.value)
-                        else
-                            [ .[] | select(.key != $target.key) | .value ]
-                        end
-                    )
-                elif type == "object" then
-                    (
-                        def to_num:
-                            if type == "number" then .
-                            elif type == "string" then tonumber? // 0
-                            else 0 end;
-                        to_entries
-                        | (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
-                        | if $target == null then
-                            from_entries
-                        else
-                            ([ .[] | select(.key != $target.key) ] | from_entries)
-                        end
-                    )
-                else
-                    .
-                end
-                ' "$f" >"$tmp"
-        fi
-
-        tmp_size=$(stat -c %s "$tmp" 2>/dev/null || echo -1)
-
-        # If trimming didn't reduce size, retry with more aggressive deletion instead of stalling.
-        if [ "$json_size" -ge 0 ] && [ "$tmp_size" -ge 0 ] && [ "$tmp_size" -ge "$json_size" ]; then
-            rm -f "$tmp"
-
-            if [ "$del_n" -lt 65536 ]; then
-                del_n=$((del_n * 2))
-                continue
-            fi
-
-            # If we're already at max aggressiveness, fall back to trimming whole packages once.
-            jq -c '
-                if type == "array" then
-                    (
-                        def to_num:
-                            if type == "number" then .
-                            elif type == "string" then tonumber? // 0
-                            else 0 end;
-                        to_entries
-                        | (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
-                        | if $target == null then
-                            map(.value)
-                        else
-                            [ .[] | select(.key != $target.key) | .value ]
-                        end
-                    )
-                elif type == "object" then
-                    (
-                        def to_num:
-                            if type == "number" then .
-                            elif type == "string" then tonumber? // 0
-                            else 0 end;
-                        to_entries
-                        | (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
-                        | if $target == null then
-                            from_entries
-                        else
-                            ([ .[] | select(.key != $target.key) ] | from_entries)
-                        end
-                    )
-                else
-                    .
-                end
-            ' "$f" >"$tmp"
-
-            tmp_size=$(stat -c %s "$tmp" 2>/dev/null || echo -1)
-            if [ "$json_size" -ge 0 ] && [ "$tmp_size" -ge 0 ] && [ "$tmp_size" -ge "$json_size" ]; then
-                rm -f "$tmp"
-                break
-            fi
-        fi
-
-        mv "$tmp" "$f"
-    done
-
-    # Ensure the XML output corresponds to the final JSON.
-    ytox "$f" >/dev/null 2>&1
-
-	# If either JSON or XML is > 100MB, empty each one that is too large:
-	[ "$(stat -c %s "$f" 2>/dev/null || echo -1)" -lt 100000000 ] || echo "{}" >"$f"
-	[ "$(stat -c %s "${f%.*}.xml" 2>/dev/null || echo -1)" -lt 100000000 ] || echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?><xml></xml>" >"${f%.*}.xml"
-}
-
 ytoy() {
     yq -oy "$1" | sed 's/"/\\"/g' >"${1%.*}.yml"
 }
@@ -665,16 +471,6 @@ clean_owners() {
     awk 'NF' "$1" >"$temp_file" && cp -f "$temp_file" "$1"
     sed -i 's/"//g; s/^[[:space:]]*//;s/[[:space:]]*$//; /^$/d; /^0\/$/d; /^null\/.*/d; /^\(.*\/\)*\(solutions\|sponsors\|enterprise\|premium-support\)$/d' "$1"
     awk '!seen[$0]++' "$1" >"$temp_file" && cp -f "$temp_file" "$1"
-}
-
-missed_owners() {
-	pushd "$BKG_INDEX_DIR" >/dev/null 2>&1 || echo ""
-	cutoff=$(get_BKG BKG_BATCH_FIRST_STARTED)
-	git ls-tree -r --name-only "$BKG_INDEX" ./ \
-		| xargs -r -I filename git log -1 --format='%cs filename' filename \
-		| awk -v cutoff="$cutoff" 'cutoff != "" && $1 < cutoff {print}' \
-		| sort | grep -oP '(?<= )[^/]+(?=/)' | uniq | awk '{print "0/"$1}'
-	popd >/dev/null 2>&1 || echo ""
 }
 
 set +o allexport

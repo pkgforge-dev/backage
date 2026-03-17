@@ -7,20 +7,26 @@
 
 root="$1"
 [[ -n "$root" && ! "${root:0:2}" =~ -(m|d) ]] && shift || root="."
-[ -d "$root" ] || { gh auth status &>/dev/null && gh repo clone "${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}" "$root"  -- --depth=1 -b "$GITHUB_BRANCH" --single-branch || git clone --depth=1 -b "$GITHUB_BRANCH" --single-branch "https://$([ -n "$GITHUB_TOKEN" ] && echo "$GITHUB_TOKEN@" || echo "")github.com/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}.git" "$root"; }
+[ -d "$root" ] || mkdir -p "$root"
+[ -d "$root/.git" ] || { gh auth status &>/dev/null && gh repo clone "${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}" "$root"  -- --depth=1 -b "$GITHUB_BRANCH" --single-branch || git clone --depth=1 -b "$GITHUB_BRANCH" --single-branch "https://github.com/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}.git" "$root"; }
+
+# actions: move db into root
+shopt -s dotglob
+[ ! -d .bkg ] || mv .bkg/* "$root"/
+shopt -u dotglob
+
 pushd "$root" || exit 1
 pushd src || exit 1
 source bkg.sh
 popd || exit 1
 
 # permissions
-[ -n "$GITHUB_TOKEN" ] || GITHUB_TOKEN=$(if git config --get remote.origin.url | grep -q '@'; then grep -oP '(?<=://)[^@]+'; else echo ""; fi)
+[ -n "$GITHUB_TOKEN" ] || GITHUB_TOKEN=$(remote_url=$(git config --get remote.origin.url); if grep -q '@' <<<"$remote_url"; then grep -oP '(?<=://)[^@]+' <<<"$remote_url"; else echo ""; fi)
 [ -n "$GITHUB_TOKEN" ] || ! gh auth status &>/dev/null || GITHUB_TOKEN=$(gh auth token)
 [ -n "$GITHUB_ACTOR" ] || GITHUB_ACTOR="${GITHUB_OWNER:-ipitio}"
 git config user.name "${GITHUB_ACTOR}"
 git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
-git config --get-regexp --name-only '^url\.https://.+\.insteadof' | xargs -n1 git config --unset-all 2>/dev/null
-git config url.https://"${GITHUB_TOKEN}"@github.com/.insteadOf https://github.com/
+git config credential.helper "!f() { echo username=${GITHUB_ACTOR}; echo password=${GITHUB_TOKEN}; }; f"
 git config --add safe.directory "$(pwd)"
 git config core.sharedRepository all
 
@@ -33,11 +39,22 @@ git update-index --index-version 4
 sudonot chmod -R a+rwX .
 sudonot find . -type d -exec chmod g+s '{}' +
 
+set -o allexport
+BKG_BRANCH=$(git branch --show-current 2>/dev/null)
+[ -n "$GITHUB_BRANCH" ] || GITHUB_BRANCH="$BKG_BRANCH"
+BKG_INDEX=$([ "$GITHUB_BRANCH" = "master" ] && echo -n "index" || echo -n "index-${BKG_BRANCH:-}")
+BKG_INDEX_DB=$BKG_ROOT/"$BKG_INDEX".db
+BKG_INDEX_SQL=$BKG_ROOT/"$BKG_INDEX".sql
+BKG_INDEX_DIR=$BKG_ROOT/"$BKG_INDEX"
+set +o allexport
+
 if git ls-remote --exit-code origin "$BKG_INDEX" &>/dev/null; then
     git worktree remove -f "$BKG_INDEX".bak &>/dev/null
     [ -d "$BKG_INDEX".bak ] || rm -rf "$BKG_INDEX".bak
     git worktree move "$BKG_INDEX" "$BKG_INDEX".bak &>/dev/null
-    git fetch origin "$BKG_INDEX"
+    git fetch --depth=1 origin "$BKG_INDEX"
+    git show-ref --verify --quiet "refs/remotes/origin/$BKG_INDEX" || git fetch origin "$BKG_INDEX:refs/remotes/origin/$BKG_INDEX"
+    git branch --track -f "$BKG_INDEX" "origin/$BKG_INDEX" 2>/dev/null || git branch -f "$BKG_INDEX" "origin/$BKG_INDEX"
     BKG_IS_FIRST=true
 else
     fd_list=$(find . -type f -o -type d | grep -vE "^\.($|\/(\.git\/*|.*\.md$))")
@@ -45,7 +62,7 @@ else
     git switch --orphan "$BKG_INDEX"
     xargs rm -rf <<<"$fd_list"
     git add .
-    git commit --allow-empty -m "init index"
+    git commit --allow-empty -m "init $BKG_INDEX"
     git push -u origin "$BKG_INDEX"
     git checkout "$([ -n "$GITHUB_BRANCH" ] && echo "$GITHUB_BRANCH" || echo "$BKG_BRANCH")"
 	git stash pop || true
@@ -84,7 +101,7 @@ if git worktree list | grep -q "$BKG_INDEX"; then
     pushd "$BKG_INDEX" || exit 1
     git add .
     git commit -m "$(date -u +%Y-%m-%d)"
-    git push
+    git push --set-upstream origin "$BKG_INDEX"
     popd || exit 1
     ! git worktree list | grep -q "$BKG_INDEX".bak || git worktree remove -f "$BKG_INDEX".bak &>/dev/null
 fi
@@ -93,7 +110,12 @@ fi
 (git merge --abort 2>/dev/null)
 (git pull --rebase --autostash -s ours &>/dev/null)
 find . -type f -name '*.txt' -exec sed -i '/^<<<<<<<\|=======\|>>>>>>>/d' {} \; 2>/dev/null
-git add -- *.txt README.md
-git commit -m "$(date -u +%Y-%m-%d)"
-git push
+git add -- *.txt README.md 2>/dev/null || git add README.md 2>/dev/null || true
+
+if ! git diff --cached --quiet; then
+    git commit -m "$(date -u +%Y-%m-%d)"
+    git push
+else
+    echo "No top-level txt/README changes to commit"
+fi
 popd || exit 1

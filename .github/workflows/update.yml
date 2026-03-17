@@ -56,13 +56,18 @@ jobs:
           fileName: "*.zst"
           tarBall: false
           zipBall: false
+          out-file-path: ".bkg"
 
       - name: Dry run
         id: update
         run: |
+          set +e
           docker run -v $PWD:/app --env-file <(env | grep GITHUB) \
             ghcr.io/ipitio/backage:master \
-            src/test/update.sh; echo "updated=$?" >> "$GITHUB_OUTPUT"
+            src/test/update.sh bkg
+          code=$?
+          echo "updated=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
 
       - name: Get date
         id: date
@@ -72,8 +77,8 @@ jobs:
         if: ${{ steps.update.outputs.updated == '0' }}
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "*.zst"
-          bodyFile: "CHANGELOG.md"
+          artifacts: "bkg/*.zst"
+          bodyFile: "bkg/CHANGELOG.md"
           tag: "v${{ steps.date.outputs.tag }}"
           commit: "master"
           allowUpdates: true
