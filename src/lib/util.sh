@@ -19,7 +19,7 @@ sudonot() {
 
 apt_install() {
     if ! dpkg -s "$@" &>/dev/null; then
-        apt-get update
+        sudonot apt-get update
         sudonot apt-get install -yqq "$@"
     fi
 }
@@ -37,18 +37,23 @@ echo "Dependencies verified!"
 # shellcheck disable=SC2046
 source $(which env_parallel.bash)
 env_parallel --session
+GITHUB_OWNER=${GITHUB_OWNER:-ipitio}
+GITHUB_REPO=${GITHUB_REPO:-backage}
 BKG_ROOT=..
 BKG_ENV=env.env
 BKG_OWNERS=$BKG_ROOT/owners.txt
 BKG_OPTOUT=$BKG_ROOT/optout.txt
-BKG_INDEX_DB=$BKG_ROOT/index.db
-BKG_INDEX_SQL=$BKG_ROOT/index.sql
-BKG_INDEX_DIR=$BKG_ROOT/index
+BKG_BRANCH=$(git branch --show-current 2>/dev/null)
+[ -n "$GITHUB_BRANCH" ] || GITHUB_BRANCH="$BKG_BRANCH"
+BKG_INDEX="index$([ "$GITHUB_BRANCH" = "master" ] && echo "" || echo "-${BKG_BRANCH:-}")"
+BKG_INDEX_DB=$BKG_ROOT/"$BKG_INDEX".db
+BKG_INDEX_SQL=$BKG_ROOT/"$BKG_INDEX".sql
+BKG_INDEX_DIR=$BKG_ROOT/"$BKG_INDEX"
 BKG_INDEX_TBL_OWN=owners
 BKG_INDEX_TBL_PKG=packages
 BKG_INDEX_TBL_VER=versions
 BKG_MODE=0
-BKG_MAX_LEN=16200
+BKG_MAX_LEN=14400
 BKG_IS_FIRST=false
 BKG_PAGE_ALL=1
 
@@ -280,13 +285,13 @@ _jq() {
 }
 
 dldb() {
-    local latest=${1:-$(curl "https://github.com/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/latest" | grep -oP "href=\"/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/tag/[^\"]+" | cut -d'/' -f6)}
-    [[ "$(curl -o /dev/null --silent -Iw '%{http_code}' "https://github.com/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/download/$latest/index.sql.zst")" != "404" ]] || return 1
+    local latest=${1:-$(curl "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest" | grep -oP "href=\"/${GITHUB_OWNER}/${GITHUB_REPO}/releases/tag/[^\"]+" | cut -d'/' -f6)}
+    [[ "$(curl -o /dev/null --silent -Iw '%{http_code}' "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download/$latest/index.sql.zst")" != "404" ]] || return 1
     [ -z "$2" ] || return 0
     echo "Downloading the latest database..."
     # `cd src ; source bkg.sh && dldb` to dl the latest db
     [ ! -f "$BKG_INDEX_DB" ] || mv "$BKG_INDEX_DB" "$BKG_INDEX_DB".bak
-    command curl -sSLNZ "https://github.com/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/download/$latest/index.sql.zst" | unzstd -v -c | sqlite3 "$BKG_INDEX_DB"
+    command curl -sSLNZ "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download/$latest/index.sql.zst" | unzstd -v -c | sqlite3 "$BKG_INDEX_DB"
 
     if [ -f "$BKG_INDEX_DB" ]; then
         [ ! -f "$BKG_INDEX_DB".bak ] || rm -f "$BKG_INDEX_DB".bak
@@ -322,13 +327,13 @@ query_api() {
 check_db() {
     local release
     local latest
-    release=$(query_api "repos/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/latest")
+    release=$(query_api "repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest")
     latest=$(jq -r '.tag_name' <<<"$release")
 
     until dldb "$latest" 1; do
         echo "Deleting the latest release..."
-        curl_gh -X DELETE "https://api.github.com/repos/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/$(jq -r '.id' <<<"$release")"
-        release=$(query_api "repos/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}/releases/latest")
+        curl_gh -X DELETE "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/$(jq -r '.id' <<<"$release")"
+        release=$(query_api "repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest")
         latest=$(jq -r '.tag_name' <<<"$release")
     done
 }
@@ -453,160 +458,196 @@ ytox() {
 }
 
 ytoxt() {
-	# ytox + trim: if the json or xml is over 50MB, remove oldest versions
-	local f="$1"
-	local tmp
-	local del_n=1
-	local last_xml_size=-1
+    # ytox + trim: if the json or xml is over 50MB, remove oldest versions
+    local f="$1"
+    local tmp
+    local del_n=1
+    local last_xml_size=-1
 
-	[ -f "$f" ] || return 1
+    [ -f "$f" ] || return 1
 
-	tmp=$(mktemp "${f}.XXXXXX") || return 1
-	trap 'rm -f "$tmp"' RETURN
+    tmp=$(mktemp "${f}.XXXXXX") || return 1
+    trap 'rm -f "$tmp"' RETURN
 
-	while [ -f "$f" ]; do
-		local json_size
-		local xml_size
-		local tmp_size
+    while [ -f "$f" ]; do
+        local json_size
+        local xml_size
+        local tmp_size
 
-		json_size=$(stat -c %s "$f" 2>/dev/null || echo -1)
+        json_size=$(stat -c %s "$f" 2>/dev/null || echo -1)
 
-		if [ "$json_size" -lt 50000000 ]; then
-			# Only generate/check XML if JSON is already under limit.
-			xml_size=$(ytox "$f" 2>/dev/null || echo -1)
-			# If XML size can't be determined, treat it as oversized so we keep trimming.
-			[ "$xml_size" -ge 0 ] || xml_size=50000000
+        if [ "$json_size" -lt 50000000 ]; then
+            # Only generate/check XML if JSON is already under limit.
+            xml_size=$(ytox "$f" 2>/dev/null || echo -1)
+            # If XML size can't be determined, treat it as oversized so we keep trimming.
+            [ "$xml_size" -ge 0 ] || xml_size=50000000
 
-			if [ "$xml_size" -lt 50000000 ]; then
-				break
-			fi
+            if [ "$xml_size" -lt 50000000 ]; then
+                break
+            fi
 
-			# If XML is still too large, keep trimming, but avoid redoing work forever.
-			if [ "$xml_size" -eq "$last_xml_size" ] && [ "$last_xml_size" -ge 0 ]; then
-				break
-			fi
-			last_xml_size="$xml_size"
+            # If XML is still too large, keep trimming, but avoid redoing work forever.
+            if [ "$xml_size" -eq "$last_xml_size" ] && [ "$last_xml_size" -ge 0 ]; then
+                break
+            fi
+            last_xml_size="$xml_size"
 
-			# XML still too large: increase trimming aggressiveness as well.
-			if [ "$del_n" -lt 65536 ]; then
-				del_n=$((del_n * 2))
-			fi
-		else
-			# JSON is still too large: increase trimming aggressiveness.
-			if [ "$json_size" -ge 50000000 ]; then
-				if [ "$del_n" -lt 65536 ]; then
-					del_n=$((del_n * 2))
-				fi
-			fi
-		fi
+            # XML still too large: increase trimming aggressiveness as well.
+            if [ "$del_n" -lt 65536 ]; then
+                del_n=$((del_n * 2))
+            fi
+        else
+            # JSON is still too large: increase trimming aggressiveness.
+            if [ "$json_size" -ge 50000000 ]; then
+                if [ "$del_n" -lt 65536 ]; then
+                    del_n=$((del_n * 2))
+                fi
+            fi
+        fi
 
-		if jq -e '
-			def has_versions:
-				if (type == "object") then
-					if ((keys | length) == 1) and ((.[keys[0]] | type) == "array") then
-						any(.[keys[0]][]?; ((.version // []) | type == "array") and ((.version // []) | length > 0))
-					else
-						((.version // []) | type == "array") and ((.version // []) | length > 0)
-					end
-				else
-					false
-				end;
-			has_versions
-		' "$f" >/dev/null; then
-			jq -c '
-				def id_to_num:
-					if type == "number" then .
-					elif type == "string" then tonumber? // 0
-					else 0 end;
-				def vlen:
-					(.version // []) | if type == "array" then length else 0 end;
-				def trim_versions($n):
-					if ((.version // []) | type == "array") and ((.version // []) | length > 0) then
-						.version |= (sort_by(.id | id_to_num) | .[$n:])
-					else
-						.
-					end;
+        if jq -e '
+            if (type == "array") or (type == "object") then
+                any(.[]; ((.version // []) | type == "array") and ((.version // []) | length > 0))
+            else
+                ((.version // []) | type == "array") and ((.version // []) | length > 0)
+            end
+        ' "$f" >/dev/null; then
+            jq -c '
+                def id_to_num:
+                    if type == "number" then .
+                    elif type == "string" then tonumber? // 0
+                    else 0 end;
+                def vlen:
+                    (.version // []) | if type == "array" then length else 0 end;
+                def trim_versions($n):
+                    if ((.version // []) | type == "array") and ((.version // []) | length > 0) then
+                        (
+                            .version
+                            | sort_by(.id | id_to_num)
+                            | .[$n:]
+                        ) as $v
+                        | .version = $v
+                    else
+                        .
+                    end;
+                if type == "array" then
+                    (to_entries
+                    | (max_by(.value | vlen) // empty) as $max
+                    | map(
+                        if .key == $max.key and ((.value | vlen) > 0)
+                        then (.value |= trim_versions($n))
+                        else .
+                        end
+                    )
+                    | map(.value))
+                elif type == "object" then
+                    (to_entries
+                    | (max_by(.value | vlen) // empty) as $max
+                    | map(
+                        if .key == $max.key and ((.value | vlen) > 0)
+                        then (.value |= trim_versions($n))
+                        else .
+                        end
+                    )
+                    | from_entries)
+                else
+                    trim_versions($n)
+                end
+            ' --argjson n "$del_n" "$f" >"$tmp"
+        else
+            jq -c '
+                if type == "array" then
+                    (
+                        def to_num:
+                            if type == "number" then .
+                            elif type == "string" then tonumber? // 0
+                            else 0 end;
+                        to_entries
+                        | (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
+                        | if $target == null then
+                            map(.value)
+                        else
+                            [ .[] | select(.key != $target.key) | .value ]
+                        end
+                    )
+                elif type == "object" then
+                    (
+                        def to_num:
+                            if type == "number" then .
+                            elif type == "string" then tonumber? // 0
+                            else 0 end;
+                        to_entries
+                        | (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
+                        | if $target == null then
+                            from_entries
+                        else
+                            ([ .[] | select(.key != $target.key) ] | from_entries)
+                        end
+                    )
+                else
+                    .
+                end
+                ' "$f" >"$tmp"
+        fi
 
-				if ((keys | length) == 1) and ((.[keys[0]] | type) == "array") then
-					. as $root
-					| (.[keys[0]] | max_by(vlen) // empty) as $max
-					| if ($max | vlen) > 0 then
-						.[keys[0]] |= map(
-							if . == $max then trim_versions($n) else . end
-						)
-					  else
-						.
-					  end
-				else
-					trim_versions($n)
-				end
-			' --argjson n "$del_n" "$f" >"$tmp"
-		else
-			jq -c '
-				def to_num:
-					if type == "number" then .
-					elif type == "string" then tonumber? // 0
-					else 0 end;
+        tmp_size=$(stat -c %s "$tmp" 2>/dev/null || echo -1)
 
-				if ((keys | length) == 1) and ((.[keys[0]] | type) == "array") then
-					. as $root
-					| .[keys[0]] as $arr
-					| ($arr | (min_by([ (.raw_downloads // 0 | to_num), (.date // "") ]) // empty)) as $target
-					| if ($target | length) == 0 then
-						.
-					  else
-						.[keys[0]] = [ $arr[] | select(. != $target) ]
-					  end
-				else
-					.
-				end
-			' "$f" >"$tmp"
-		fi
+        # If trimming didn't reduce size, retry with more aggressive deletion instead of stalling.
+        if [ "$json_size" -ge 0 ] && [ "$tmp_size" -ge 0 ] && [ "$tmp_size" -ge "$json_size" ]; then
+            rm -f "$tmp"
 
-		tmp_size=$(stat -c %s "$tmp" 2>/dev/null || echo -1)
+            if [ "$del_n" -lt 65536 ]; then
+                del_n=$((del_n * 2))
+                continue
+            fi
 
-		# If trimming didn't reduce size, retry with more aggressive deletion instead of stalling.
-		if [ "$json_size" -ge 0 ] && [ "$tmp_size" -ge 0 ] && [ "$tmp_size" -ge "$json_size" ]; then
-			rm -f "$tmp"
+            # If we're already at max aggressiveness, fall back to trimming whole packages once.
+            jq -c '
+                if type == "array" then
+                    (
+                        def to_num:
+                            if type == "number" then .
+                            elif type == "string" then tonumber? // 0
+                            else 0 end;
+                        to_entries
+                        | (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
+                        | if $target == null then
+                            map(.value)
+                        else
+                            [ .[] | select(.key != $target.key) | .value ]
+                        end
+                    )
+                elif type == "object" then
+                    (
+                        def to_num:
+                            if type == "number" then .
+                            elif type == "string" then tonumber? // 0
+                            else 0 end;
+                        to_entries
+                        | (min_by([ (.value.raw_downloads // 0 | to_num), (.value.date // "") ]) // null) as $target
+                        | if $target == null then
+                            from_entries
+                        else
+                            ([ .[] | select(.key != $target.key) ] | from_entries)
+                        end
+                    )
+                else
+                    .
+                end
+            ' "$f" >"$tmp"
 
-			if [ "$del_n" -lt 65536 ]; then
-				del_n=$((del_n * 2))
-				continue
-			fi
+            tmp_size=$(stat -c %s "$tmp" 2>/dev/null || echo -1)
+            if [ "$json_size" -ge 0 ] && [ "$tmp_size" -ge 0 ] && [ "$tmp_size" -ge "$json_size" ]; then
+                rm -f "$tmp"
+                break
+            fi
+        fi
 
-			# If we're already at max aggressiveness, fall back to trimming whole packages once.
-			jq -c '
-				def to_num:
-					if type == "number" then .
-					elif type == "string" then tonumber? // 0
-					else 0 end;
+        mv "$tmp" "$f"
+    done
 
-				if ((keys | length) == 1) and ((.[keys[0]] | type) == "array") then
-					. as $root
-					| .[keys[0]] as $arr
-					| ($arr | (min_by([ (.raw_downloads // 0 | to_num), (.date // "") ]) // empty)) as $target
-					| if ($target | length) == 0 then
-						.
-					  else
-						.[keys[0]] = [ $arr[] | select(. != $target) ]
-					  end
-				else
-					.
-				end
-			' "$f" >"$tmp"
-
-			tmp_size=$(stat -c %s "$tmp" 2>/dev/null || echo -1)
-			if [ "$json_size" -ge 0 ] && [ "$tmp_size" -ge 0 ] && [ "$tmp_size" -ge "$json_size" ]; then
-				rm -f "$tmp"
-				break
-			fi
-		fi
-
-		mv "$tmp" "$f"
-	done
-
-	# Ensure the XML output corresponds to the final JSON.
-	ytox "$f" >/dev/null 2>&1
+    # Ensure the XML output corresponds to the final JSON.
+    ytox "$f" >/dev/null 2>&1
 
 	# If either JSON or XML is > 100MB, empty each one that is too large:
 	[ "$(stat -c %s "$f" 2>/dev/null || echo -1)" -lt 100000000 ] || echo "{}" >"$f"
@@ -624,6 +665,16 @@ clean_owners() {
     awk 'NF' "$1" >"$temp_file" && cp -f "$temp_file" "$1"
     sed -i 's/"//g; s/^[[:space:]]*//;s/[[:space:]]*$//; /^$/d; /^0\/$/d; /^null\/.*/d; /^\(.*\/\)*\(solutions\|sponsors\|enterprise\|premium-support\)$/d' "$1"
     awk '!seen[$0]++' "$1" >"$temp_file" && cp -f "$temp_file" "$1"
+}
+
+missed_owners() {
+	pushd "$BKG_INDEX_DIR" >/dev/null 2>&1 || echo ""
+	cutoff=$(get_BKG BKG_BATCH_FIRST_STARTED)
+	git ls-tree -r --name-only "$BKG_INDEX" ./ \
+		| xargs -r -I filename git log -1 --format='%cs filename' filename \
+		| awk -v cutoff="$cutoff" 'cutoff != "" && $1 < cutoff {print}' \
+		| sort | grep -oP '(?<= )[^/]+(?=/)' | uniq | awk '{print "0/"$1}'
+	popd >/dev/null 2>&1 || echo ""
 }
 
 set +o allexport
