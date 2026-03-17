@@ -28,7 +28,7 @@ Otherwise, if this is a fork, you'd prefer an alternative method, or your packag
 > [!TIP]
 > You only need to add names to the queue; IDs are fetched as needed and entries are removed once processed.
 
-New packages won't be added until *all* existing ones are refreshed; you should also create an independent instance that'll update faster and more frequently. Simply fork just the `master` branch, choose one of the following options, and use the [Alternative URL](#alternative-url) when it changes. This centralized repo will then serve as a backup for all subsets of packages not in `optout.txt`.
+New packages may not be added until *all* existing ones are refreshed; you should also create an independent instance that'll update faster and more frequently. Simply fork just the `master` branch, choose one of the following options, and use the [Alternative URL](#alternative-url) when it changes. This centralized repo will then serve as a backup for all subsets of packages not in `optout.txt`.
 
 > [!IMPORTANT]
 > Your own packages will be picked up automatically! If you need to edit `owners.txt`, do so after the first run.
@@ -49,16 +49,11 @@ This will use a lot of minutes on GitHub-hosted runners, so you may want to use 
 This is an example for `systemd`; adapt it to your needs. Please note:
 
 - Docker needs to be installed
-- You don't need to set `GITHUB_TOKEN` if you first log in with `gh` or use your PAT to run:
-
-```bash
-git clone --depth=1 -b master --single-branch [https|ssh]://<PAT>@github.com/pkgforge-dev/backage /opt/backage/master
-```
-
+- You don't need to set `GITHUB_TOKEN` if you first log in with `gh`
 - `-m 0` ensures only the public packages of the owners you've added are updated (default)
   - You'll need the proper permissions to update private packages
 - `-d 0` allows everything to be updated in one go
-  - A graceful restart is initiated every 4.5 hours by default
+  - A graceful restart is initiated every 4 hours by default
 
 ```bash
 echo "[Unit]
