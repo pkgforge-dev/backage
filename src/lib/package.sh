@@ -58,12 +58,10 @@ update_package() {
     local raw_downloads_week=-1
     local raw_downloads_day=-1
     local size=-1
-    local versions_json=""
     local version_count=-1
     local version_with_tag_count=-1
     local version_newest_id=-1
     local latest_version=-1
-    local latest_tags
     local owner_rank
     local repo_rank
     package_type=$(cut -d'/' -f1 <<<"$1")
@@ -92,7 +90,7 @@ update_package() {
                 return
             fi
         done < <(grep "$owner" "$BKG_OPTOUT")
-    elif $fast_out; then
+    elif [ "${fast_out:-false}" = "true" ]; then
         return
     fi
 
@@ -120,35 +118,80 @@ update_package() {
         echo "Updating $owner/$package..."
         raw_downloads=$(grep -Pzo 'Total downloads[^"]*"\d*' <<<"$html" | grep -Pzo '\d*$' | tr -d '\0') # https://stackoverflow.com/a/74214537
         sqlite3 "$BKG_INDEX_DB" "select id from '$table_version_name' where date >= '$BKG_BATCH_FIRST_STARTED';" | sort -u >"${table_version_name}"_already_updated
-        local break_now=false
+        local max_version_pages=3
+        local tag_cache_pages=3
+        local page=1
+        local pages_left=0
+        local pipeline_status=0
+        local update_versions_status=0
+        local version_lines
 
-        for page in $(seq 0 5); do
-            ((page > 0)) || continue
-            local pages_left=0
+        version_reset_pipeline "$tag_cache_pages"
+
+        page_version "$page"
+        pages_left=$?
+        if ((pages_left == 3)); then
+            parallel_async_wait || :
+            rm -f "${table_version_name}"_already_updated
+            return 3
+        fi
+
+        version_lines=$(jq -r '.[] | @base64' <<<"$VERSION_PAGE_JSON")
+        if [ -n "$version_lines" ]; then
+            version_hydrate_candidates "$version_lines" 0
+            pipeline_status=$?
+
+            if ((pipeline_status != 3)); then
+                version_submit_current_page_candidates 5 false
+                pipeline_status=$?
+            fi
+
+            if ((pipeline_status != 3)); then
+                version_collect_current_page_provisional 5
+                version_resolve_provisional_candidates "$tag_cache_pages"
+                pipeline_status=$?
+            fi
+        fi
+
+        while ((pipeline_status != 3)) && ((pages_left != 2)) && ((page < max_version_pages)) && ((${#VERSION_PROVISIONAL_IDS[@]} > 0)); do
+            ((page++))
             page_version "$page"
             pages_left=$?
-            versions_json=$(jq -c -s '.' "$BKG_INDEX_DIR/$owner/$repo/$package".*.json 2>/dev/null)
-            rm -f "$BKG_INDEX_DIR/$owner/$repo/$package".*.json
-            ((pages_left != 3)) || return 3
-            jq -e . <<<"$versions_json" &>/dev/null || versions_json="[{\"id\":\"-1\",\"name\":\"latest\",\"tags\":\"\"}]"
-            ! jq -e 'length > 1' <<<"$versions_json" &>/dev/null || versions_json=$(jq -c 'map(select(.id >= 0))' <<<"$versions_json")
-            [ -n "$latest_tags" ] || latest_tags=$(
-                jq -r '
-                    [ .[]
-                    | select(.tags | split(",") | map(gsub("^\\s+|\\s+$";"")) | any(. == "latest"))
-                    | .tags
-                    ][0] // ""
-                ' <<<"$versions_json"
-            )
-            latest_tags=$(perl -pe 's/(?<!\\)"/\\"/g' <<<"$latest_tags")
-            run_parallel update_version "$(jq -r '.[] | @base64' <<<"$versions_json")"
-            (($? != 3)) || return 3
-            ((pages_left != 2)) || break
-            ! $break_now || break
-            [ -z "$latest_tags" ] || break_now=true
+
+            if ((pages_left == 3)); then
+                pipeline_status=3
+                break
+            fi
+
+            version_lines=$(jq -r '.[] | @base64' <<<"$VERSION_PAGE_JSON")
+            [ -n "$version_lines" ] || continue
+
+            version_hydrate_candidates "$version_lines" 0
+            pipeline_status=$?
+            ((pipeline_status != 3)) || break
+            version_promote_current_page_candidates "$tag_cache_pages"
+            pipeline_status=$?
         done
 
+        if ((pipeline_status != 3)) && ((${#VERSION_SOURCE_LINES[@]} == 0)); then
+            version_store_fallback_candidate
+            version_submit_candidate "-1"
+            pipeline_status=$?
+        fi
+
+        if ((pipeline_status != 3)); then
+            for version_id in "${VERSION_PROVISIONAL_IDS[@]}"; do
+                version_submit_candidate "$version_id"
+                pipeline_status=$?
+                ((pipeline_status != 3)) || break
+            done
+        fi
+
+        parallel_async_wait
+        update_versions_status=$?
+
         rm -f "${table_version_name}"_already_updated
+        ((pipeline_status != 3 && update_versions_status != 3)) || return 3
     fi
 
     # calculate the overall downloads and size

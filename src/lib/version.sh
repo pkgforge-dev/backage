@@ -9,82 +9,128 @@ save_version() {
     local version_id
     local version_name
     local version_tags
+    local version_size
+    local version_dl
+    local version_dl_month
+    local version_dl_week
+    local version_dl_day
+    local version_json
+
     version_id=$(_jq "$1" '.id')
     version_name=$(_jq "$1" '.name')
-    [[ "$version_id" =~ ^[0-9]+$ ]] || version_id=-1
+    version_size=$(_jq "$1" '.size')
+    version_dl=$(_jq "$1" '.downloads')
+    version_dl_month=$(_jq "$1" '.downloads_month')
+    version_dl_week=$(_jq "$1" '.downloads_week')
+    version_dl_day=$(_jq "$1" '.downloads_day')
+    version_tags=$(_jq "$1" '.tags')
+    [[ "$version_id" =~ ^[0-9]+$ ]] || version_id=\"$version_id\"
+    [[ "$version_size" =~ ^[0-9]+$ ]] || version_size=-1
+    [[ "$version_dl" =~ ^[0-9]+$ ]] || version_dl=-1
+    [[ "$version_dl_month" =~ ^[0-9]+$ ]] || version_dl_month=-1
+    [[ "$version_dl_week" =~ ^[0-9]+$ ]] || version_dl_week=-1
+    [[ "$version_dl_day" =~ ^[0-9]+$ ]] || version_dl_day=-1
+    [[ -z "$version_tags" || "$version_tags" =~ ^\".*\"$ ]] || version_tags=\"$version_tags\"
+    version_json="{
+        \"id\": $version_id,
+        \"name\": \"$version_name\",
+        \"date\": \"$(date -u +%Y-%m-%d)\",
+        \"newest\": false,
+        \"latest\": false,
+        \"size\": \"$(numfmt_size <<<"$version_size")\",
+        \"downloads\": \"$(numfmt <<<"$version_dl")\",
+        \"downloads_month\": \"$(numfmt <<<"$version_dl_month")\",
+        \"downloads_week\": \"$(numfmt <<<"$version_dl_week")\",
+        \"downloads_day\": \"$(numfmt <<<"$version_dl_day")\",
+        \"raw_size\": $version_size,
+        \"raw_downloads\": $version_dl,
+        \"raw_downloads_month\": $version_dl_month,
+        \"raw_downloads_week\": $version_dl_week,
+        \"raw_downloads_day\": $version_dl_day,
+        \"tags\": [${version_tags//,/\",\"}]
+    }"
+    echo "$version_json" | tr -d '\n' | jq -c . >"$BKG_INDEX_DIR/$owner/$repo/$package.d/$version_id.json" || echo "Failed to refresh $owner/$repo/$package/$version_id: $version_json"
+}
 
-    if [ -f "${table_version_name}"_already_updated ]; then
-        check_limit || return $?
-        ! grep -q "$version_id" "${table_version_name}"_already_updated || return
-        version_tags=$(_jq "$1" '.. | try .tags | select(. != null and . != "") | join(",")')
-        version_tags=$(perl -pe 's/(?<!\\)"/\\"/g' <<<"$version_tags")
-        [[ -n "$version_tags" && "$version_tags" != "[]" ]] || version_tags=$(_jq "$1" '.. | try .tags | select(. != null and . != "")')
-        version_tags=$(perl -pe 's/(?<!\\)"/\\"/g' <<<"$version_tags")
+version_parse_page_html() {
+    [ -n "$1" ] || return
+    VERSION_OWNER_PREFIX="$owner_type/$owner/packages/$package_type/$package" \
+        VERSION_REPO_PREFIX="$owner/$repo/pkgs/$package_type/$package" \
+        perl -0ne '
+            sub decode_text {
+                my ($value) = @_;
+                $value //= q{};
+                $value =~ s/&amp;/&/g;
+                $value =~ s/&quot;/"/g;
+                $value =~ s/&#39;/'"'"'/g;
+                $value =~ s/&lt;/</g;
+                $value =~ s/&gt;/>/g;
+                $value =~ s/\+/ /g;
+                $value =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg;
+                return $value;
+            }
 
-        if [[ -z "$version_tags" || "$version_tags" == "[]" || "$version_tags" == '"[]"' ]]; then
-            for page in $(seq 1 2); do
-                local html
-                html=$(curl "https://github.com/$owner/$repo/pkgs/$package_type/$package/versions?page=$page")
-                (($? != 3)) || return 3
+            sub escape_json {
+                my ($value) = @_;
+                $value //= q{};
+                $value =~ s/\\/\\\\/g;
+                $value =~ s/"/\\"/g;
+                $value =~ s/\n/\\n/g;
+                return $value;
+            }
 
-                if [ -n "$(grep -zo "$version_id" <<<"$html" | tr -d '\0')" ]; then
-                    version_tags=$(grep -Po '(?<='"$version_id"'\?tag=)[^\"]+' <<<"$html" | tr -d '\0' | tr '\n' ',' | sed 's/,$//')
-                elif (($(grep -Po '\?tag=' <<<"$html" | wc -l) >= 30)); then
-                    continue
-                fi
+            my $owner_prefix = quotemeta($ENV{VERSION_OWNER_PREFIX});
+            my $repo_prefix = quotemeta($ENV{VERSION_REPO_PREFIX});
+            my $prefix_pattern = qr/(?:$owner_prefix|$repo_prefix)/;
 
-                break
-            done
-        fi
+            while (/<li\b[^>]*class="Box-row"[^>]*>(.*?)<\/li>/sg) {
+                my $block = $1;
+                my ($version_id, $version_name);
+                my %seen_tags;
+                my @version_tags;
 
-        version_tags=$(perl -pe 's/(?<!\\)"/\\"/g' <<<"$version_tags")
-        [[ "$version_tags" != "[]" && "$version_tags" != '"[]"' ]] || version_tags=""
-        [[ "$version_tags" =~ ^\".*\"$ ]] || version_tags=\"$version_tags\"
-        echo "{
-            \"id\": $version_id,
-            \"name\": \"$version_name\",
-            \"tags\": $version_tags
-        }" | tr -d '\n' | jq -c . >"$BKG_INDEX_DIR/$owner/$repo/$package.$version_id.json" || echo "Failed to save $owner/$repo/$package/$version_id with tags: $version_tags"
-    else
-        local version_size
-        local version_dl
-        local version_dl_month
-        local version_dl_week
-        local version_dl_day
-        local version_json
-        version_size=$(_jq "$1" '.size')
-        version_dl=$(_jq "$1" '.downloads')
-        version_dl_month=$(_jq "$1" '.downloads_month')
-        version_dl_week=$(_jq "$1" '.downloads_week')
-        version_dl_day=$(_jq "$1" '.downloads_day')
-        version_tags=$(_jq "$1" '.tags')
-        [[ "$version_id" =~ ^[0-9]+$ ]] || version_id=\"$version_id\"
-        [[ "$version_size" =~ ^[0-9]+$ ]] || version_size=-1
-        [[ "$version_dl" =~ ^[0-9]+$ ]] || version_dl=-1
-        [[ "$version_dl_month" =~ ^[0-9]+$ ]] || version_dl_month=-1
-        [[ "$version_dl_week" =~ ^[0-9]+$ ]] || version_dl_week=-1
-        [[ "$version_dl_day" =~ ^[0-9]+$ ]] || version_dl_day=-1
-        [[ -z "$version_tags" || "$version_tags" =~ ^\".*\"$ ]] || version_tags=\"$version_tags\"
-        version_json="{
-            \"id\": $version_id,
-            \"name\": \"$version_name\",
-            \"date\": \"$(date -u +%Y-%m-%d)\",
-            \"newest\": false,
-            \"latest\": false,
-            \"size\": \"$(numfmt_size <<<"$version_size")\",
-            \"downloads\": \"$(numfmt <<<"$version_dl")\",
-            \"downloads_month\": \"$(numfmt <<<"$version_dl_month")\",
-            \"downloads_week\": \"$(numfmt <<<"$version_dl_week")\",
-            \"downloads_day\": \"$(numfmt <<<"$version_dl_day")\",
-            \"raw_size\": $version_size,
-            \"raw_downloads\": $version_dl,
-            \"raw_downloads_month\": $version_dl_month,
-            \"raw_downloads_week\": $version_dl_week,
-            \"raw_downloads_day\": $version_dl_day,
-            \"tags\": [${version_tags//,/\",\"}]
-        }"
-        echo "$version_json" | tr -d '\n' | jq -c . >"$BKG_INDEX_DIR/$owner/$repo/$package.d/$version_id.json" || echo "Failed to refresh $owner/$repo/$package/$version_id: $version_json"
-    fi
+                while ($block =~ m{href="/$prefix_pattern/([0-9]+)\?tag=([^"&]+)}g) {
+                    $version_id //= $1;
+                    my $tag = decode_text($2);
+                    next if $tag eq q{} || $seen_tags{$tag}++;
+                    push @version_tags, $tag;
+                }
+
+                if (!$version_id && $block =~ m{href="/$prefix_pattern/([0-9]+)"}g) {
+                    $version_id = $1;
+                }
+
+                next unless $version_id;
+
+                if ($block =~ m{href="/$prefix_pattern/\Q$version_id\E"[^>]*>([^<]+)</a>}s) {
+                    $version_name = decode_text($1);
+                }
+
+                if ((!defined $version_name || $version_name eq q{}) && $block =~ m{value="([^"]+)"}s) {
+                    $version_name = decode_text($1);
+                }
+
+                if ((!defined $version_name || $version_name eq q{}) && $block =~ m{<span class="color-fg-muted">([^<]+)</span>}s) {
+                    my $candidate = decode_text($1);
+                    $version_name = $candidate if $candidate =~ /^(?:sha256:|[[:alnum:]][^[:space:]]*)/;
+                }
+
+                $version_name = $version_id unless defined $version_name && $version_name ne q{};
+
+                my $tags_json = join q{,}, map { q{"} . escape_json($_) . q{"} } @version_tags;
+                print qq[{"id":$version_id,"name":"] . escape_json($version_name) . qq[","tags":[$tags_json]}\n];
+            }
+        ' <<<"$1" | jq -cs '.'
+}
+
+version_page_from_html() {
+    [ -n "$1" ] || return
+    [ -n "$package" ] || return
+    local html
+
+    html=$(curl "https://github.com/$owner/$repo/pkgs/$package_type/$package/versions?page=$1")
+    (($? != 3)) || return 3
+    version_parse_page_html "$html"
 }
 
 page_version() {
@@ -92,20 +138,288 @@ page_version() {
     [ -n "$1" ] || return
     [ -n "$package" ] || return
     local versions_json_more="[]"
-    local version_lines
+
+    VERSION_PAGE_JSON="[]"
+    VERSION_PAGE_COUNT=0
 
     if [ -n "$GITHUB_TOKEN" ]; then
         echo "Starting $owner/$package page $1..."
-        versions_json_more=$(query_api "$owner_type/$owner/packages/$package_type/$package/versions?per_page=20&page=$1")
+        versions_json_more=$(query_api "$owner_type/$owner/packages/$package_type/$package/versions?per_page=30&page=$1")
+        (($? != 3)) || return 3
+    fi
+
+    if ! jq -e '.[].id' <<<"$versions_json_more" &>/dev/null; then
+        (($1 > 1)) || echo "Falling back to HTML for $owner/$package..."
+        versions_json_more=$(version_page_from_html "$1")
         (($? != 3)) || return 3
     fi
 
     jq -e '.[].id' <<<"$versions_json_more" &>/dev/null || return 2
-    version_lines=$(jq -r '.[] | @base64' <<<"$versions_json_more")
-    run_parallel save_version "$version_lines"
-    (($? != 3)) || return 3
+    VERSION_PAGE_JSON=$(jq -c '.[0:30]' <<<"$versions_json_more")
+    VERSION_PAGE_COUNT=$(jq 'length' <<<"$VERSION_PAGE_JSON")
     echo "Started $owner/$package page $1"
-    [ "$(wc -l <<<"$version_lines")" -gt 1 ] || return 2
+    ((VERSION_PAGE_COUNT >= 30)) || return 2
+}
+
+version_extract_tags() {
+    [ -n "$1" ] || return
+    local version_tags
+
+    version_tags=$(_jq "$1" '.. | .tags? // empty | if type == "array" then join(",") else . end' | paste -sd, -)
+    [[ "$version_tags" != "[]" && "$version_tags" != '"[]"' ]] || version_tags=""
+    echo "$version_tags"
+}
+
+version_merge_tags() {
+    [ -n "$1$2" ] || return
+    printf '%s\n%s\n' "${1//,/$'\n'}" "${2//,/$'\n'}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d' | awk '!seen[$0]++' | paste -sd, -
+}
+
+version_reset_pipeline() {
+    local max_tag_pages=${1:-3}
+
+    unset VERSION_TAG_CACHE VERSION_SOURCE_LINES VERSION_SUBMITTED VERSION_PROVISIONAL_IDS VERSION_PAGE_IDS
+    declare -gA VERSION_TAG_CACHE=()
+    declare -gA VERSION_SOURCE_LINES=()
+    declare -gA VERSION_SUBMITTED=()
+    declare -ga VERSION_PROVISIONAL_IDS=()
+    declare -ga VERSION_PAGE_IDS=()
+    VERSION_PAGE_JSON="[]"
+    VERSION_PAGE_COUNT=0
+    VERSION_TAG_CACHE_MAX_PAGES=$max_tag_pages
+    VERSION_TAG_CACHE_PAGES_FETCHED=0
+    VERSION_TAG_CACHE_EXHAUSTED=false
+}
+
+version_has_unresolved_ids() {
+    [ -n "$1" ] || return 1
+    $VERSION_TAG_CACHE_EXHAUSTED && return 1
+
+    while IFS= read -r version_id; do
+        [ -n "$version_id" ] || continue
+        [ -n "${VERSION_TAG_CACHE[$version_id]+x}" ] || return 0
+    done <<<"$1"
+
+    return 1
+}
+
+version_load_tag_cache_page() {
+    [ -n "$1" ] || return
+    [ -n "$package" ] || return
+    local html
+    local tag_link_count=0
+
+    html=$(curl "https://github.com/$owner/$repo/pkgs/$package_type/$package/versions?filters%5Bversion_type%5D=tagged&page=$1")
+    (($? != 3)) || return 3
+    tag_link_count=$(grep -Po '\?tag=' <<<"$html" | wc -l)
+
+    while IFS='|' read -r version_id version_tags; do
+        [ -n "$version_id" ] || continue
+        VERSION_TAG_CACHE["$version_id"]=$(version_merge_tags "${VERSION_TAG_CACHE[$version_id]}" "$version_tags")
+    done < <(VERSION_OWNER_PREFIX="$owner_type/$owner/packages/$package_type/$package" \
+        VERSION_REPO_PREFIX="$owner/$repo/pkgs/$package_type/$package" \
+        perl -0ne '
+            sub decode_text {
+                my ($value) = @_;
+                $value //= q{};
+                $value =~ s/\+/ /g;
+                $value =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg;
+                return $value;
+            }
+
+            my $owner_prefix = quotemeta($ENV{VERSION_OWNER_PREFIX});
+            my $repo_prefix = quotemeta($ENV{VERSION_REPO_PREFIX});
+            my $prefix_pattern = qr/(?:$owner_prefix|$repo_prefix)/;
+
+            while (/href="\/$prefix_pattern\/([0-9]+)\?tag=([^"&]+)/g) {
+                my $tag = decode_text($2);
+                next if $tag eq q{} || $seen{$1}{$tag}++;
+                push @{$tags{$1}}, $tag;
+            }
+
+            END {
+                for my $id (keys %tags) {
+                    print "$id|" . join(q{,}, @{$tags{$id}}) . "\n";
+                }
+            }
+        ' <<<"$html")
+
+    ((VERSION_TAG_CACHE_PAGES_FETCHED++))
+    ((tag_link_count >= 30)) || VERSION_TAG_CACHE_EXHAUSTED=true
+}
+
+version_extend_tag_cache() {
+    [ -n "$1" ] || return
+    local watched_ids=$1
+    local requested_pages=${2:-0}
+    local remaining_pages=0
+
+    ((requested_pages > 0)) || return
+    remaining_pages=$((VERSION_TAG_CACHE_MAX_PAGES - VERSION_TAG_CACHE_PAGES_FETCHED))
+    ((remaining_pages > 0)) || return
+    ((requested_pages > remaining_pages)) && requested_pages=$remaining_pages
+
+    while ((requested_pages > 0)) && version_has_unresolved_ids "$watched_ids"; do
+        version_load_tag_cache_page "$((VERSION_TAG_CACHE_PAGES_FETCHED + 1))"
+        (($? != 3)) || return 3
+        ((requested_pages--))
+    done
+}
+
+version_cache_candidate() {
+    [ -n "$1" ] || return
+    local version_id
+    local version_tags
+
+    version_id=$(_jq "$1" '.id')
+    [[ "$version_id" =~ ^[0-9]+$ ]] || version_id=-1
+    VERSION_SOURCE_LINES["$version_id"]="$1"
+    version_tags=$(version_extract_tags "$1")
+    [ -n "$version_tags" ] && VERSION_TAG_CACHE["$version_id"]=$(version_merge_tags "${VERSION_TAG_CACHE[$version_id]}" "$version_tags")
+}
+
+version_hydrate_candidates() {
+    [ -n "$1" ] || return
+    local requested_tag_pages=${2:-0}
+    local unresolved_ids=""
+    local version_id
+    local version_line
+    local -a version_lines_a=()
+
+    VERSION_PAGE_IDS=()
+    mapfile -t version_lines_a <<<"$1"
+
+    for version_line in "${version_lines_a[@]}"; do
+        [ -n "$version_line" ] || continue
+        version_id=$(_jq "$version_line" '.id')
+        [[ "$version_id" =~ ^[0-9]+$ ]] || version_id=-1
+        version_cache_candidate "$version_line"
+        VERSION_PAGE_IDS+=("$version_id")
+
+        if [ -z "${VERSION_TAG_CACHE[$version_id]}" ]; then
+            unresolved_ids+="$version_id"$'\n'
+        fi
+    done
+
+    version_extend_tag_cache "$unresolved_ids" "$requested_tag_pages"
+    (($? != 3)) || return 3
+}
+
+version_candidate_is_tagged() {
+    [ -n "$1" ] || return
+    [ -n "${VERSION_TAG_CACHE[$1]}" ]
+}
+
+version_render_candidate() {
+    [ -n "$1" ] || return
+    [ -n "${VERSION_SOURCE_LINES[$1]+x}" ] || return
+
+    echo "${VERSION_SOURCE_LINES[$1]}" | base64 --decode | jq -c --arg tags "${VERSION_TAG_CACHE[$1]}" '{id, name, tags: $tags}' | base64 | tr -d '\n'
+}
+
+version_submit_candidate() {
+    [ -n "$1" ] || return
+    [ -n "${VERSION_SOURCE_LINES[$1]+x}" ] || return
+    [ -z "${VERSION_SUBMITTED[$1]+x}" ] || return
+    local candidate
+
+    if [ -f "${table_version_name}"_already_updated ] && grep -Fxq "$1" "${table_version_name}"_already_updated; then
+        VERSION_SUBMITTED["$1"]=1
+        return
+    fi
+
+    candidate=$(version_render_candidate "$1")
+    [ -n "$candidate" ] || return
+    parallel_async_submit update_version "$candidate"
+    (($? != 3)) || return 3
+    VERSION_SUBMITTED["$1"]=1
+}
+
+version_store_fallback_candidate() {
+    VERSION_SOURCE_LINES["-1"]=$(printf '%s' '{"id":-1,"name":"latest"}' | base64 | tr -d '\n')
+    VERSION_TAG_CACHE["-1"]=""
+}
+
+version_pop_provisional_slot() {
+    ((${#VERSION_PROVISIONAL_IDS[@]} > 0)) || return 1
+    unset 'VERSION_PROVISIONAL_IDS[0]'
+    VERSION_PROVISIONAL_IDS=("${VERSION_PROVISIONAL_IDS[@]}")
+}
+
+version_submit_current_page_candidates() {
+    local commit_count=${1:-0}
+    local consume_provisional=${2:-false}
+    local index
+    local version_id
+
+    for ((index = 0; index < ${#VERSION_PAGE_IDS[@]}; index++)); do
+        if $consume_provisional && ((${#VERSION_PROVISIONAL_IDS[@]} == 0)); then
+            break
+        fi
+
+        version_id=${VERSION_PAGE_IDS[index]}
+        [ -z "${VERSION_SUBMITTED[$version_id]+x}" ] || continue
+
+        if ((index < commit_count)) || version_candidate_is_tagged "$version_id"; then
+            version_submit_candidate "$version_id"
+            (($? != 3)) || return 3
+            $consume_provisional && version_pop_provisional_slot || :
+        fi
+    done
+}
+
+version_collect_current_page_provisional() {
+    local start_index=${1:-0}
+    local index
+    local version_id
+
+    VERSION_PROVISIONAL_IDS=()
+
+    for ((index = ${#VERSION_PAGE_IDS[@]} - 1; index >= start_index; index--)); do
+        version_id=${VERSION_PAGE_IDS[index]}
+
+        if [ -z "${VERSION_SUBMITTED[$version_id]+x}" ] && ! version_candidate_is_tagged "$version_id"; then
+            VERSION_PROVISIONAL_IDS+=("$version_id")
+        fi
+    done
+}
+
+version_resolve_provisional_candidates() {
+    local requested_tag_pages=${1:-0}
+    local watched_ids
+    local version_id
+    local -a unresolved_ids=()
+
+    ((${#VERSION_PROVISIONAL_IDS[@]} > 0)) || return 0
+    watched_ids=$(printf '%s\n' "${VERSION_PROVISIONAL_IDS[@]}")
+    version_extend_tag_cache "$watched_ids" "$requested_tag_pages"
+    (($? != 3)) || return 3
+
+    for version_id in "${VERSION_PROVISIONAL_IDS[@]}"; do
+        if version_candidate_is_tagged "$version_id"; then
+            version_submit_candidate "$version_id"
+            (($? != 3)) || return 3
+        else
+            unresolved_ids+=("$version_id")
+        fi
+    done
+
+    VERSION_PROVISIONAL_IDS=("${unresolved_ids[@]}")
+}
+
+version_promote_current_page_candidates() {
+    local requested_tag_pages=${1:-0}
+    local watched_ids
+
+    version_submit_current_page_candidates 0 true
+    (($? != 3)) || return 3
+    ((${#VERSION_PROVISIONAL_IDS[@]} > 0)) || return 0
+
+    watched_ids=$(printf '%s\n' "${VERSION_PAGE_IDS[@]}")
+    version_extend_tag_cache "$watched_ids" "$requested_tag_pages"
+    (($? != 3)) || return 3
+    version_submit_current_page_candidates 0 true
+    (($? != 3)) || return 3
 }
 
 update_version() {

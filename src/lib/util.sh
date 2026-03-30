@@ -30,13 +30,16 @@ yq_install() {
     sudonot chmod +x /usr/bin/yq
 }
 
-echo "Verifying dependencies..."
-apt_install git curl jq parallel sqlite3 sqlite3-pcre zstd libxml2-utils
-yq -V | grep -q mikefarah 2>/dev/null || yq_install
-echo "Dependencies verified!"
-# shellcheck disable=SC2046
-source $(which env_parallel.bash)
-env_parallel --session
+if [ -z "${BKG_UTIL_BOOTSTRAPPED:-}" ]; then
+    if [ "${BKG_SKIP_DEP_VERIFY:-0}" != "1" ]; then
+        echo "Verifying dependencies..."
+        apt_install git curl jq parallel sqlite3 sqlite3-pcre zstd libxml2-utils
+        yq -V | grep -q mikefarah 2>/dev/null || yq_install
+        echo "Dependencies verified!"
+    fi
+
+    BKG_UTIL_BOOTSTRAPPED=1
+fi
 GITHUB_OWNER=${GITHUB_OWNER:-ipitio}
 GITHUB_REPO=${GITHUB_REPO:-backage}
 BKG_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"/../..
@@ -174,10 +177,9 @@ check_limit() {
     local min_passed
     local rate_limit_start
     rate_limit_end=$(date -u +%s)
-    [ -n "$BKG_SCRIPT_START" ] && rate_limit_start="$BKG_SCRIPT_START" || {
-        rate_limit_start=$(get_BKG BKG_SCRIPT_START)
-        [ -n "$rate_limit_start" ] || echo "BKG_SCRIPT_START empty!"
-    }
+    rate_limit_start=$(get_BKG BKG_SCRIPT_START)
+    [ -n "$rate_limit_start" ] || rate_limit_start="$BKG_SCRIPT_START"
+    [ -n "$rate_limit_start" ] || echo "BKG_SCRIPT_START empty!"
     script_limit_diff=$((rate_limit_end - rate_limit_start))
     ((script_limit_diff < BKG_MAX_LEN)) || save_and_exit
     (($? != 3)) || return 3
@@ -279,6 +281,61 @@ run_parallel() {
     code=$(cat "$exit_code")
     rm -f "$exit_code"
     ! grep -q "3" <<<"$code" || return 3
+}
+
+parallel_shell_func() {
+    [ -n "$1" ] || return
+    [ -n "$2" ] || return
+    local source_file=$1
+    local function_name=$2
+    shift 2
+
+    parallel "$@" bash "$BKG_ROOT/src/lib/parallel-worker.sh" "$source_file" "$function_name"
+}
+
+parallel_async_status() {
+    [ -n "$PARALLEL_ASYNC_EXIT_CODE" ] || return
+    [ -f "$PARALLEL_ASYNC_EXIT_CODE" ] || return
+    ! grep -Fxq "3" "$PARALLEL_ASYNC_EXIT_CODE" || return 3
+}
+
+parallel_async_submit() {
+    [ -n "$1" ] || return
+    [ -n "$2" ] || return
+
+    if [ -z "$PARALLEL_ASYNC_EXIT_CODE" ]; then
+        PARALLEL_ASYNC_EXIT_CODE=$(mktemp)
+        PARALLEL_ASYNC_MAX_JOBS=$(nproc --all)
+        PARALLEL_ASYNC_RUNNING=0
+    fi
+
+    parallel_async_status || return $?
+
+    while [ "$PARALLEL_ASYNC_RUNNING" -ge "$PARALLEL_ASYNC_MAX_JOBS" ]; do
+        wait -n || :
+        ((PARALLEL_ASYNC_RUNNING--))
+        parallel_async_status || return $?
+    done
+
+    ("$1" "$2" || printf '%s\n' "$?" >>"$PARALLEL_ASYNC_EXIT_CODE") &
+    ((PARALLEL_ASYNC_RUNNING++))
+}
+
+parallel_async_wait() {
+    local status=0
+
+    [ -n "$PARALLEL_ASYNC_EXIT_CODE" ] || return 0
+
+    while ((PARALLEL_ASYNC_RUNNING > 0)); do
+        wait -n || :
+        ((PARALLEL_ASYNC_RUNNING--))
+        parallel_async_status || status=$?
+    done
+
+    parallel_async_status || status=$?
+    rm -f "$PARALLEL_ASYNC_EXIT_CODE"
+    unset PARALLEL_ASYNC_EXIT_CODE PARALLEL_ASYNC_MAX_JOBS PARALLEL_ASYNC_RUNNING
+    return "$status"
 }
 
 _jq() {
@@ -410,7 +467,7 @@ explore() {
 	local is_repo=false
 	local is_user=false
 	local got_orgs=false
-	[[ "$node" =~ .*\/.* ]] && is_repo=true || is_user=true
+	[[ ! "$node" =~ .*\/.* ]] || is_repo=true
     [ "$is_repo" = true ] && local graph=("stargazers" "watchers" "forks" "collaborators") || local graph=("followers" "following" "people")
     [ -z "$2" ] || graph=("$2")
 
