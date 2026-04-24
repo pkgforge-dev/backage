@@ -17,10 +17,86 @@
 
 source lib/owner.sh
 
+owner_update_wait_notice() {
+	local started_at=${1:-0}
+	local last_notice_at=${2:-0}
+	local now
+	local elapsed
+	local notice_interval=300
+
+	OWNER_UPDATE_WAIT_STARTED=$started_at
+	OWNER_UPDATE_WAIT_LAST_NOTICE=$last_notice_at
+	OWNER_UPDATE_WAIT_MESSAGE=""
+	now=$(date -u +%s)
+
+	if ((OWNER_UPDATE_WAIT_STARTED == 0)); then
+		OWNER_UPDATE_WAIT_STARTED=$now
+		OWNER_UPDATE_WAIT_LAST_NOTICE=$now
+		OWNER_UPDATE_WAIT_MESSAGE="Waiting for active owner updates to stop..."
+		return
+	fi
+
+	if ((now - OWNER_UPDATE_WAIT_LAST_NOTICE < notice_interval)); then
+		return
+	fi
+
+	OWNER_UPDATE_WAIT_LAST_NOTICE=$now
+	elapsed=$((now - OWNER_UPDATE_WAIT_STARTED))
+	OWNER_UPDATE_WAIT_MESSAGE="Still waiting for active owner updates to stop after ${elapsed}s..."
+}
+
+owner_update_force_stop_due() {
+	local started_at=${1:-0}
+	local grace_period=${2:-180}
+	local now
+
+	OWNER_UPDATE_FORCE_STOP_DUE=false
+	((started_at > 0)) || return
+	now=$(date -u +%s)
+	if ((now - started_at >= grace_period)); then
+		OWNER_UPDATE_FORCE_STOP_DUE=true
+	fi
+}
+
+owner_update_collect_child_pids() {
+	local root_pid=$1
+	local child_pid
+
+	[ -n "$root_pid" ] || return
+
+	while IFS= read -r child_pid; do
+		child_pid=$(awk '{print $1}' <<<"$child_pid")
+		[ -n "$child_pid" ] || continue
+		printf '%s\n' "$child_pid"
+		owner_update_collect_child_pids "$child_pid"
+	done < <(ps -o pid= --ppid "$root_pid" 2>/dev/null)
+}
+
+owner_update_force_stop() {
+	local root_pid=$1
+	local pid
+	local -a pids=()
+
+	[ -n "$root_pid" ] || return
+
+	while IFS= read -r pid; do
+		[ -n "$pid" ] || continue
+		pids+=("$pid")
+	done < <(owner_update_collect_child_pids "$root_pid")
+
+	pids+=("$root_pid")
+	terminate_pids_with_grace "${pids[@]}"
+}
+
 run_owner_updates() {
 	local owners_queue
 	local status=0
 	local updates_pid=""
+	local stop_wait_started=0
+	local last_wait_notice=0
+	local graceful_stop_window=${BKG_OWNER_UPDATE_STOP_GRACE:-180}
+	local forced_stop=false
+	local elapsed=0
 	owners_queue=$(get_BKG_set BKG_OWNERS_QUEUE)
 	[ -n "$owners_queue" ] || return 0
 
@@ -34,17 +110,174 @@ run_owner_updates() {
 			sleep 30
 			kill -0 "$updates_pid" 2>/dev/null || break
 			[ "$(get_BKG BKG_TIMEOUT)" = "1" ] || continue
-			echo "Waiting for active owner updates to stop..."
+			owner_update_wait_notice "$stop_wait_started" "$last_wait_notice"
+			stop_wait_started=$OWNER_UPDATE_WAIT_STARTED
+			last_wait_notice=$OWNER_UPDATE_WAIT_LAST_NOTICE
+			[ -z "$OWNER_UPDATE_WAIT_MESSAGE" ] || echo "$OWNER_UPDATE_WAIT_MESSAGE"
+
+			owner_update_force_stop_due "$stop_wait_started" "$graceful_stop_window"
+			if ! $forced_stop && $OWNER_UPDATE_FORCE_STOP_DUE; then
+				elapsed=$(( $(date -u +%s) - stop_wait_started ))
+				echo "Graceful stop window exceeded after ${elapsed}s; force-stopping active owner updates..."
+				owner_update_force_stop "$updates_pid"
+				forced_stop=true
+			fi
 		done
 
 		wait "$updates_pid"
 		status=$?
+		if $forced_stop && [ "$(get_BKG BKG_TIMEOUT)" = "1" ]; then
+			status=3
+		fi
 	else # typically fewer owners
 		run_parallel update_owner "$owners_queue"
 		status=$?
 	fi
 
 	return "$status"
+}
+
+run_owner_page_discovery() {
+	local page=1
+	local max_pages=${BKG_OWNER_DISCOVERY_MAX_PAGES:-1}
+	local status=0
+
+	while ((page <= max_pages)); do
+		page_owner "$page"
+		status=$?
+
+		if ((status == 0)); then
+			((page++))
+			continue
+		fi
+
+		if ((status == 2)); then
+			return 0
+		fi
+
+		return "$status"
+	done
+
+	return 0
+}
+
+startup_phase_started_at() {
+	date -u +%s
+}
+
+log_startup_phase() {
+	local phase=$1
+	local started_at=${2:-0}
+	local elapsed=0
+
+	((started_at > 0)) || return 0
+	elapsed=$(( $(date -u +%s) - started_at ))
+	echo "Startup phase '$phase' completed in ${elapsed}s"
+}
+
+log_prequeue_elapsed_once() {
+	[ "${BKG_QUEUE_START_LOGGED:-0}" = "1" ] && return 0
+	BKG_QUEUE_START_LOGGED=1
+	log_startup_phase "pre-queue-work" "${BKG_STARTUP_STARTED_AT:-0}"
+}
+
+db_restore_signature_file() {
+	printf '%s\n' "${BKG_INDEX_DB}.snapshot.sha256"
+}
+
+current_index_snapshot_archive_file() {
+	local db_archive_file=""
+	local legacy_archive_file=""
+
+	db_archive_file=$(db_snapshot_archive_file 2>/dev/null || :)
+	if [ -n "$db_archive_file" ] && [ -f "$db_archive_file" ]; then
+		printf '%s\n' "$db_archive_file"
+		return 0
+	fi
+
+	db_archive_file=$(legacy_db_snapshot_archive_file 2>/dev/null || :)
+	if [ -n "$db_archive_file" ] && [ -f "$db_archive_file" ]; then
+		printf '%s\n' "$db_archive_file"
+		return 0
+	fi
+
+	legacy_archive_file=$(legacy_sql_snapshot_archive_file 2>/dev/null || :)
+	if [ -n "$legacy_archive_file" ] && [ -f "$legacy_archive_file" ]; then
+		printf '%s\n' "$legacy_archive_file"
+		return 0
+	fi
+
+	return 1
+}
+
+current_index_snapshot_signature() {
+	local archive_file
+	archive_file=$(current_index_snapshot_archive_file) || return 1
+	sha256sum "$archive_file" | awk '{print $1}'
+}
+
+restore_db_from_index_snapshot_if_needed() {
+	local archive_file
+	local archive_name
+	local archive_kind
+	local signature_file
+	local current_signature
+	local stored_signature=""
+	local db_tmp=""
+
+	archive_file=$(current_index_snapshot_archive_file) || return 0
+	archive_name=$(basename "$archive_file")
+	case "$archive_file" in
+		*.db) archive_kind="db" ;;
+		*.db.zst) archive_kind="db" ;;
+		*) archive_kind="sql" ;;
+	esac
+
+	signature_file=$(db_restore_signature_file)
+	current_signature=$(sha256sum "$archive_file" | awk '{print $1}')
+	[ -f "$signature_file" ] && stored_signature=$(cat "$signature_file")
+
+	if [ -s "$BKG_INDEX_DB" ] && [ -n "$stored_signature" ] && [ "$stored_signature" = "$current_signature" ]; then
+		echo "Using existing database; $archive_name unchanged"
+		return 0
+	fi
+
+	[ ! -f "$BKG_INDEX_DB" ] || mv "$BKG_INDEX_DB" "$BKG_INDEX_DB".bak
+
+	if [ "$archive_kind" = "db" ]; then
+		echo "Restoring database from $archive_name..."
+		db_tmp=$(mktemp "$(dirname "$BKG_INDEX_DB")/.${BKG_INDEX_DB##*/}.XXXXXX") || return 1
+		if { [[ "$archive_file" = *.zst ]] && unzstd -c "$archive_file" >"$db_tmp"; } || { [[ "$archive_file" != *.zst ]] && cp -f "$archive_file" "$db_tmp"; }; then
+			mv -f "$db_tmp" "$BKG_INDEX_DB"
+		else
+			rm -f "$db_tmp"
+		fi
+	else
+		echo "Restoring database from legacy $archive_name..."
+		if unzstd -c "$archive_file" | command sqlite3 "$BKG_INDEX_DB"; then
+			true
+		fi
+	fi
+
+	if [ -f "$BKG_INDEX_DB" ]; then
+		printf '%s\n' "$current_signature" >"$signature_file"
+		[ ! -f "$BKG_INDEX_DB".bak ] || rm -f "$BKG_INDEX_DB".bak
+		return 0
+	fi
+
+	[ ! -f "$BKG_INDEX_DB" ] || rm -f "$BKG_INDEX_DB"
+	[ ! -f "$BKG_INDEX_DB".bak ] || mv "$BKG_INDEX_DB".bak "$BKG_INDEX_DB"
+	return 1
+}
+
+write_db_restore_signature() {
+	local current_signature
+	current_signature=$(current_index_snapshot_signature) || return 0
+	printf '%s\n' "$current_signature" >"$(db_restore_signature_file)"
+}
+
+checkpoint_database_for_archive() {
+	command sqlite3 "$BKG_INDEX_DB" 'pragma wal_checkpoint(truncate);' >/dev/null 2>&1 || sqlite3 "$BKG_INDEX_DB" 'pragma wal_checkpoint(truncate);' >/dev/null 2>&1 || :
 }
 
 main() {
@@ -61,8 +294,10 @@ main() {
 	local phase_status=0
 	local opted_out
 	local opted_out_before
+	local owners_queue_source
 	local rest_first
-	local request_limit=200
+	local request_limit=100
+	local phase_started_at=0
 	connections=$(mktemp) || exit 1
 	temp_connections=$(mktemp) || exit 1
 
@@ -83,6 +318,8 @@ main() {
 
 	today=$(date -u +%Y-%m-%d)
 	BKG_SCRIPT_START=$(date -u +%s)
+	BKG_STARTUP_STARTED_AT=$BKG_SCRIPT_START
+	BKG_QUEUE_START_LOGGED=0
 	[ -n "$(get_BKG BKG_BATCH_FIRST_STARTED)" ] || set_BKG BKG_BATCH_FIRST_STARTED "$today"
 	[ -n "$(get_BKG BKG_RATE_LIMIT_START)" ] || set_BKG BKG_RATE_LIMIT_START "$(date -u +%s)"
 	[ -n "$(get_BKG BKG_MIN_RATE_LIMIT_START)" ] || set_BKG BKG_MIN_RATE_LIMIT_START "$(date -u +%s)"
@@ -91,7 +328,10 @@ main() {
 	[ -n "$(get_BKG BKG_LAST_SCANNED_ID)" ] || set_BKG BKG_LAST_SCANNED_ID "0"
 	[ -n "$(get_BKG BKG_DIFF)" ] || set_BKG BKG_DIFF "0"
 	[ -n "$(get_BKG BKG_REST_TO_TOP)" ] || set_BKG BKG_REST_TO_TOP "0"
+	[ -n "$(get_BKG BKG_BATCH_MARKER)" ] || set_BKG BKG_BATCH_MARKER "$(generate_batch_marker)"
 	BKG_BATCH_FIRST_STARTED=$(get_BKG BKG_BATCH_FIRST_STARTED)
+	reset_owner_id_cache || return 1
+	set_BKG BKG_DISCOVERED_CONNECTION_OWNERS ""
 	set_BKG BKG_OWNERS_QUEUE ""
 	set_BKG BKG_TIMEOUT "0"
 	set_BKG BKG_SCRIPT_START "$BKG_SCRIPT_START"
@@ -108,14 +348,22 @@ main() {
 		set_BKG BKG_MIN_CALLS_TO_API "0"
 	fi
 
-	if [ -f "$BKG_INDEX_SQL.zst" ]; then
-		[ ! -f "$BKG_INDEX_DB" ] || mv "$BKG_INDEX_DB" "$BKG_INDEX_DB".bak
-		unzstd -c "$BKG_INDEX_SQL.zst" | sqlite3 "$BKG_INDEX_DB"
+	if current_index_snapshot_archive_file >/dev/null 2>&1; then
+		phase_started_at=$(startup_phase_started_at)
+		restore_db_from_index_snapshot_if_needed || :
+		log_startup_phase "restore-db-from-snapshot" "$phase_started_at"
 	fi
 
 	[ -f "$BKG_INDEX_DB" ] || {
 		[ -f "$BKG_INDEX_DB".bak ] && mv "$BKG_INDEX_DB".bak "$BKG_INDEX_DB" || sqlite3 "$BKG_INDEX_DB" ""
 	}
+	phase_started_at=$(startup_phase_started_at)
+	sqlite3 "$BKG_INDEX_DB" "create table if not exists '$BKG_INDEX_TBL_OWN' (
+		owner_id text not null,
+		owner text not null,
+		date text not null,
+		primary key (owner_id, date)
+	);"
 	sqlite3 "$BKG_INDEX_DB" "create table if not exists '$BKG_INDEX_TBL_PKG' (
         owner_id text,
         owner_type text not null,
@@ -148,60 +396,80 @@ main() {
 	opted_out=$(wc -l <"$BKG_OPTOUT")
 	opted_out_before=$(get_BKG BKG_OUT)
 	fast_out=$([ "$GITHUB_OWNER" = "ipitio" ] && [ -n "$opted_out_before" ] && ((opted_out_before < opted_out)) && echo "true" || echo "false")
+	log_startup_phase "prepare-package-state" "$phase_started_at"
 
 	if [ "$BKG_MODE" -ne 2 ]; then
 		if [ "$BKG_MODE" -eq 0 ] || [ "$BKG_MODE" -eq 3 ]; then
 			if $fast_out; then
+				log_prequeue_elapsed_once
 				grep -oP '^[^\/]+' "$BKG_OPTOUT" | parallel_shell_func "$BKG_ROOT/src/lib/owner.sh" save_owner --lb
 				return_code=1
 			else
 				if [ "$GITHUB_OWNER" = "ipitio" ]; then
-					explore "$GITHUB_OWNER" >"$connections"
-					phase_status=$?
-					((phase_status != 3)) || return_code=3
-					explore "$GITHUB_OWNER/$GITHUB_REPO" >>"$connections"
-					phase_status=$?
-					((phase_status != 3)) || return_code=3
+					if daily_gate_should_skip_today BKG_LAST_EXPLORE_DATE "$today"; then
+						: >"$connections"
+						echo "Skipping explore; already ran today"
+					else
+						phase_started_at=$(startup_phase_started_at)
+						explore "$GITHUB_OWNER" >"$connections"
+						phase_status=$?
+						((phase_status != 3)) || return_code=3
+						explore "$GITHUB_OWNER/$GITHUB_REPO" >>"$connections"
+						phase_status=$?
+						((phase_status != 3)) || return_code=3
+						log_startup_phase "discover-connections" "$phase_started_at"
 
-					if ((return_code != 3)); then
+						if ((return_code != 3)); then
 
-						# get orgs of connections
-						while read -r connection; do
-							curl_orgs "$connection" >>"$temp_connections"
-							phase_status=$?
-							if ((phase_status == 3)); then
-								return_code=3
-								break
-							fi
-						done <"$connections"
-						cat "$temp_connections" >>"$connections"
+							# get orgs of connections
+							phase_started_at=$(startup_phase_started_at)
+							while read -r connection; do
+								curl_orgs "$connection" >>"$temp_connections"
+								phase_status=$?
+								if ((phase_status == 3)); then
+									return_code=3
+									break
+								fi
+							done <"$connections"
+							cat "$temp_connections" >>"$connections"
+							log_startup_phase "expand-connection-orgs" "$phase_started_at"
+						fi
 					fi
 
 					sed -i 's/^[[:space:]]*//;s/[[:space:]]*$//; /^$/d; /^0\/$/d' "$connections"
+					if ! daily_gate_completed_today BKG_LAST_EXPLORE_DATE "$today" && ((return_code != 3)); then
+						mark_daily_gate_completed BKG_LAST_EXPLORE_DATE "$today"
+					fi
 					# shellcheck disable=SC2319
 					BKG_PAGE_ALL=$(
 						(($(wc -l <"$BKG_OWNERS") < $(($(sort -u "$connections" | wc -l) + 100))))
 						echo "$?"
 					)
 					if ((return_code != 3)); then
-						seq 1 2 | parallel_shell_func "$BKG_ROOT/src/lib/owner.sh" page_owner --lb --halt soon,fail=1
+						phase_started_at=$(startup_phase_started_at)
+						run_owner_page_discovery
 						phase_status=$?
 						((phase_status != 3)) || return_code=3
+						log_startup_phase "page-owner-discovery" "$phase_started_at"
 					fi
 				else
+					phase_started_at=$(startup_phase_started_at)
 					get_membership "$GITHUB_OWNER" >"$connections"
 					phase_status=$?
 					((phase_status != 3)) || return_code=3
 					[ "$BKG_IS_FIRST" = "false" ] || : >"$BKG_OWNERS"
 					[ "$BKG_IS_FIRST" = "false" ] || : >"$BKG_OPTOUT"
+					log_startup_phase "discover-membership" "$phase_started_at"
 				fi
 
 				if ((return_code == 3)); then
 					echo "Reached BKG_MAX_LEN, stopping after persisting state..."
 				else
 				if (( 9999 < pkg_done )) || (( pkg_left < 4 )) || [[ "${db_size_curr::-4}" == "${db_size_prev::-4}" ]]; then
+					# reset the batch
 					BKG_BATCH_FIRST_STARTED=$today
 					set_BKG BKG_BATCH_FIRST_STARTED "$today"
+					set_BKG BKG_BATCH_MARKER "$(generate_batch_marker)"
 					rm -f packages_to_update
 					\cp packages_all packages_to_update
 					: >packages_already_updated
@@ -214,22 +482,71 @@ main() {
 				grep -vFxf owners_updated all_owners_tu >owners_stale
 				sort "$connections" | uniq -c | sort -nr | awk '{print $2}' >"$connections".bak
 				mv "$connections".bak "$connections"
+				sqlite3 "$BKG_INDEX_DB" "select owner from '$BKG_INDEX_TBL_OWN' where date >= '$BKG_BATCH_FIRST_STARTED' order by owner asc;" >owners_scanned_without_packages
+				grep -vFxf owners_scanned_without_packages "$connections" >"$connections".filtered || :
+				mv "$connections".filtered "$connections"
 				clean_owners "$BKG_OWNERS"
 				grep -vFxf all_owners_in_db "$BKG_OWNERS" >owners.tmp
 				mv owners.tmp "$BKG_OWNERS"
 				rest_first=$(get_BKG BKG_REST_TO_TOP)
-				bash lib/get.sh "$rest_first" "$connections" $request_limit "$GITHUB_OWNER" "$BKG_OWNERS" "$BKG_INDEX_DIR" | parallel_shell_func "$BKG_ROOT/src/lib/owner.sh" save_owner --lb
-				rm -f all_owners_in_db all_owners_tu owners_updated owners_partially_updated owners_stale
+				log_prequeue_elapsed_once
+				phase_started_at=$(startup_phase_started_at)
+				owners_queue_source="$BKG_OWNERS"
+				if daily_gate_should_skip_today BKG_LAST_OWNERS_QUEUE_DATE "$today"; then
+					owners_queue_source=/dev/null
+					echo "Skipping owners.txt queue; already ran today"
+				fi
+				local owner_candidates_file
+				owner_candidates_file=$(mktemp) || return 1
+				local owner_ids_file
+				owner_ids_file=$(mktemp) || {
+					rm -f "$owner_candidates_file"
+					return 1
+				}
+				bash lib/get.sh "$rest_first" "$connections" $request_limit "$GITHUB_OWNER" "$owners_queue_source" "$BKG_INDEX_DIR" >"$owner_candidates_file"
+				phase_status=$?
+				((phase_status != 3)) || return_code=3
+				if ((return_code != 3)); then
+					if [ -s "$owner_candidates_file" ]; then
+						resolve_owner_ids "$owner_candidates_file" >"$owner_ids_file"
+					else
+						: >"$owner_ids_file"
+					fi
+					phase_status=$?
+					((phase_status != 3)) || return_code=3
+				fi
+				if ((return_code != 3)); then
+					set_BKG BKG_DISCOVERED_CONNECTION_OWNERS ""
+					if [ -s "$owner_ids_file" ]; then
+						while IFS= read -r owner_ref; do
+							[ -n "$owner_ref" ] || continue
+							set_BKG_set BKG_DISCOVERED_CONNECTION_OWNERS "$owner_ref" >/dev/null
+						done < <(awk -F'/' 'NR==FNR { discovered[$0] = 1; next } { owner = $NF; if (owner in discovered) print $0 }' "$connections" "$owner_ids_file")
+					fi
+					[ ! -s "$owner_ids_file" ] || parallel_shell_func "$BKG_ROOT/src/lib/owner.sh" queue_owner_id --lb <"$owner_ids_file"
+					phase_status=$?
+					((phase_status != 3)) || return_code=3
+				fi
+				rm -f "$owner_candidates_file"
+				rm -f "$owner_ids_file"
+				if [ "$owners_queue_source" != "/dev/null" ] && ((return_code != 3)); then
+					mark_daily_gate_completed BKG_LAST_OWNERS_QUEUE_DATE "$today"
+				fi
+				log_startup_phase "queue-discovered-owners" "$phase_started_at"
+				rm -f all_owners_in_db all_owners_tu owners_updated owners_partially_updated owners_stale owners_scanned_without_packages
 				set_BKG BKG_DIFF "$db_size_curr"
 				set_BKG BKG_REST_TO_TOP "$((1 - rest_first))"
 				fi
 			fi
 		else
+			log_prequeue_elapsed_once
 			save_owner "$GITHUB_OWNER"
+			phase_started_at=$(startup_phase_started_at)
 			get_membership "$GITHUB_OWNER" >"$connections"
 			if [ -s "$connections" ]; then
 				parallel_shell_func "$BKG_ROOT/src/lib/owner.sh" save_owner --lb <"$connections" || while read -r connection; do save_owner "$connection"; done <"$connections"
 			fi
+			log_startup_phase "queue-membership-owners" "$phase_started_at"
 		fi
 
 		rm -f "$connections"
@@ -238,6 +555,24 @@ main() {
 		[ -d "$BKG_INDEX_DIR" ] || mkdir "$BKG_INDEX_DIR"
 
 		if ((return_code != 3)); then
+			local queued_owner_file
+			local queued_owner_count
+			local materialize_started_at
+			queued_owner_file=$(mktemp) || return 1
+			materialize_started_at=$(startup_phase_started_at)
+			index_queue_owner_names >"$queued_owner_file"
+			queued_owner_count=$(awk 'NF' "$queued_owner_file" | wc -l)
+			echo "Materializing $queued_owner_count queued owner tree(s)..."
+
+			if [ -s "$queued_owner_file" ]; then
+				index_sparse_add_paths <"$queued_owner_file" || {
+					rm -f "$queued_owner_file"
+					return $?
+				}
+			fi
+			rm -f "$queued_owner_file"
+			log_startup_phase "materialize-queued-owner-trees" "$materialize_started_at"
+
 			run_owner_updates
 			phase_status=$?
 			if ((phase_status == 3)); then
@@ -248,31 +583,44 @@ main() {
 
 		set_BKG BKG_OUT "$(wc -l <"$BKG_OPTOUT")"
 		sqlite3 "$BKG_INDEX_DB" "select owner_id, owner, repo, package from '$BKG_INDEX_TBL_PKG';" | sort -u >packages_all
-		echo "Compressing the database..."
-		sqlite3 "$BKG_INDEX_DB" ".dump" | zstd -22 --ultra --long -T0 -o "$BKG_INDEX_SQL".new.zst
+		echo "Preparing the database snapshot..."
+		checkpoint_database_for_archive
+		db_archive_file=$(db_snapshot_archive_file)
+		db_archive_tmp="$db_archive_file.new"
+		mkdir -p "$(dirname "$db_archive_file")"
+		cp -f "$BKG_INDEX_DB" "$db_archive_tmp"
 
-		if [ -f "$BKG_INDEX_SQL".new.zst ]; then
+		if [ -f "$db_archive_tmp" ]; then
 			# rotate the database if it's greater than 2GB
-			if [ -f "$BKG_INDEX_SQL".zst ] && [ "$(stat -c %s "$BKG_INDEX_SQL".new.zst)" -ge 2000000000 ]; then
+			if [ "$(stat -c %s "$db_archive_tmp")" -ge 2000000000 ]; then
 				rotated=true
 				echo "Rotating the database..."
 				local older_db
-				older_db="$(date -u +%Y.%m.%d)".zst
-				[ ! -f "$older_db" ] || rm -f "$older_db"
-				mv "$BKG_INDEX_SQL".zst "$older_db"
+				older_db="$(dirname "$db_archive_file")/$(date -u +%Y.%m.%d).$(basename "$db_archive_file").zst"
+				if [ -f "$db_archive_file" ]; then
+					[ ! -f "$older_db" ] || rm -f "$older_db"
+					zstd -22 --ultra --long -T0 "$db_archive_file" -o "$older_db"
+					rm -f "$db_archive_file"
+				fi
 				sqlite3 "$BKG_INDEX_DB" "delete from '$BKG_INDEX_TBL_PKG' where date < '$BKG_BATCH_FIRST_STARTED';"
 				sqlite3 "$BKG_INDEX_DB" "select name from sqlite_master where type='table' and name like '${BKG_INDEX_TBL_VER}_%';" | parallel --lb "sqlite3 '$BKG_INDEX_DB' 'delete from {} where date < \"$BKG_BATCH_FIRST_STARTED\";'"
 				sqlite3 "$BKG_INDEX_DB" "vacuum;"
-				rm -f "$BKG_INDEX_SQL".new.zst
-				sqlite3 "$BKG_INDEX_DB" ".dump" | zstd -22 --ultra --long -T0 -o "$BKG_INDEX_SQL".new.zst
+				checkpoint_database_for_archive
+				rm -f "$db_archive_tmp"
+				cp -f "$BKG_INDEX_DB" "$db_archive_tmp"
 				echo "Rotated the database"
 			fi
 
-			mv "$BKG_INDEX_SQL".new.zst "$BKG_INDEX_SQL".zst
-			chmod 666 "$BKG_INDEX_SQL".zst
-			echo "Compressed the database"
+			mv "$db_archive_tmp" "$db_archive_file"
+			legacy_db_archive_file=$(legacy_db_snapshot_archive_file 2>/dev/null || :)
+			[ -z "$legacy_db_archive_file" ] || rm -f "$legacy_db_archive_file"
+			legacy_archive_file=$(legacy_sql_snapshot_archive_file 2>/dev/null || :)
+			[ -z "$legacy_archive_file" ] || rm -f "$legacy_archive_file"
+			write_db_restore_signature
+			chmod 666 "$db_archive_file"
+			echo "Prepared the database snapshot"
 		else
-			echo "Failed to compress the database!"
+			echo "Failed to prepare the database snapshot!"
 		fi
 	fi
 

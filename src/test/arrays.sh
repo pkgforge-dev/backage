@@ -74,9 +74,20 @@ write_package_json() {
 
 build_owner_arrays() {
 	local owner_dir=$1
+	local json_file
+	local -a json_files=()
 	local repo
 
-	find "$owner_dir" -type f -name '*.json' ! -name '.*' -print0 | xargs -0 jq -cs '.' >"$owner_dir/.json.tmp"
+	find "$owner_dir" -type f \( -name '*.json.tmp' -o -name '*.json.abs' -o -name '*.json.rel' \) -delete
+	mapfile -d '' -t json_files < <(find "$owner_dir" -type f -name '*.json' ! -name '.*' -print0 | LC_ALL=C sort -z)
+	if ((${#json_files[@]} == 0)); then
+		printf '[]\n' >"$owner_dir/.json.tmp"
+	else
+		for json_file in "${json_files[@]}"; do
+			cat "$json_file"
+			printf '\n'
+		done | jq -cs '.' >"$owner_dir/.json.tmp"
+	fi
 	mv -f "$owner_dir/.json.tmp" "$owner_dir/.json"
 	bash "$src_dir/lib/ytoxt.sh" "$owner_dir/.json" >/dev/null
 
@@ -125,6 +136,51 @@ test_small_owner_and_repo_arrays() {
 	assert_repo_only "$owner_dir/SideRepo/.json" "SideRepo"
 	assert_contains "$owner_dir/SideRepo/.xml" "sidecar"
 	assert_not_contains "$owner_dir/SideRepo/.xml" "libre-closet"
+}
+
+test_owner_arrays_cleanup_stale_json_sidecars() {
+	local owner_dir="$workdir/sidecars/Lazztech"
+	local empty_payload="$workdir/empty-sidecars.txt"
+
+	: >"$empty_payload"
+	mkdir -p "$owner_dir/Libre-Closet"
+
+	write_package_json "$owner_dir/Libre-Closet/libre-closet.json" "Lazztech" "Libre-Closet" "libre-closet" 1 "$empty_payload"
+	printf '%s\n' 'stale owner tmp' >"$owner_dir/owner.json.tmp"
+	printf '%s\n' 'stale repo abs' >"$owner_dir/Libre-Closet/libre-closet.json.abs"
+
+	build_owner_arrays "$owner_dir"
+
+	[ ! -f "$owner_dir/owner.json.tmp" ] || fail "Expected owner array creation to remove stale .json.tmp files"
+	[ ! -f "$owner_dir/Libre-Closet/libre-closet.json.abs" ] || fail "Expected owner array creation to remove stale .json.abs files"
+}
+
+test_owner_arrays_stream_json_into_jq() {
+	local owner_dir="$workdir/stream/Lazztech"
+	local empty_payload="$workdir/empty-stream.txt"
+
+	: >"$empty_payload"
+	mkdir -p "$owner_dir/Libre-Closet"
+
+	write_package_json "$owner_dir/Libre-Closet/libre-closet.json" "Lazztech" "Libre-Closet" "libre-closet" 1 "$empty_payload"
+	write_package_json "$owner_dir/Libre-Closet/libre-closet-dev.json" "Lazztech" "Libre-Closet" "libre-closet-dev" 1 "$empty_payload"
+
+	jq() {
+		local arg
+		if [ "${1:-}" = "-cs" ] && [ "${2:-}" = "." ]; then
+			for arg in "$@"; do
+				[[ "$arg" == *.json ]] && fail "Expected owner array creation to stream JSON into jq instead of passing file paths"
+			done
+		fi
+
+		command jq "$@"
+	}
+
+	build_owner_arrays "$owner_dir"
+	unset -f jq
+
+	assert_file_exists "$owner_dir/.json"
+	assert_json_length "$owner_dir/.json" 2
 }
 
 test_large_array_trimming() {
@@ -177,9 +233,41 @@ test_large_array_trimming() {
 	[ "$repo_versions_after" -lt "$repo_versions_before" ] || fail "Expected repo array trimming to remove versions"
 }
 
+test_unsorted_version_arrays_still_trim_by_numeric_id() {
+	local payload_file="$workdir/payload-unsorted.txt"
+	local json_file="$workdir/unsorted-package.json"
+
+	head -c 13000000 /dev/zero | tr '\0' 'a' >"$payload_file"
+
+	jq -nc \
+		--rawfile payload "$payload_file" \
+		--arg date "2026-03-30" '
+		{
+			owner: "Lazztech",
+			repo: "Libre-Closet",
+			package: "libre-closet",
+			downloads: "1",
+			raw_downloads: 1,
+			date: $date,
+			version: [
+				{id: 5, name: "v5", tags: ["latest"], downloads: "1", raw_downloads: 1, date: $date, notes: $payload},
+				{id: 1, name: "v1", tags: ["tag-1"], downloads: "1", raw_downloads: 1, date: $date, notes: $payload},
+				{id: 4, name: "v4", tags: ["tag-4"], downloads: "1", raw_downloads: 1, date: $date, notes: $payload},
+				{id: 3, name: "v3", tags: ["tag-3"], downloads: "1", raw_downloads: 1, date: $date, notes: $payload}
+			]
+		}' >"$json_file"
+
+	bash "$src_dir/lib/ytoxt.sh" "$json_file" >/dev/null
+
+	jq -e '.version | map(.id) == [4,5]' "$json_file" >/dev/null || fail "Expected ytoxt.sh to keep trimming by numeric version id even when input version arrays are unsorted"
+}
+
 trap cleanup EXIT
 
-test_small_owner_and_repo_arrays
-test_large_array_trimming
+run_test test_small_owner_and_repo_arrays
+run_test test_owner_arrays_cleanup_stale_json_sidecars
+run_test test_owner_arrays_stream_json_into_jq
+run_test test_large_array_trimming
+run_test test_unsorted_version_arrays_still_trim_by_numeric_id
 
 echo "Array creation regression tests passed"

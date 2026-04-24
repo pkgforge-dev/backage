@@ -53,10 +53,10 @@ jobs:
         uses: robinraju/release-downloader@v1
         with:
           latest: true
-          fileName: "*.zst"
+          fileName: "*.db"
           tarBall: false
           zipBall: false
-          out-file-path: ".bkg"
+          out-file-path: ".bkg/.snapshot"
 
       - name: Dry run
         id: update
@@ -64,7 +64,7 @@ jobs:
           set +e
           docker run -v $PWD:/app --env-file <(env | grep GITHUB) \
             ghcr.io/ipitio/backage:master \
-            src/test/update.sh bkg
+            src/update.sh bkg
           code=$?
           echo "updated=$code" >> "$GITHUB_OUTPUT"
           exit "$code"
@@ -77,7 +77,7 @@ jobs:
         if: ${{ steps.update.outputs.updated == '0' }}
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "bkg/*.zst"
+          artifacts: "bkg/.snapshot/*"
           bodyFile: "bkg/CHANGELOG.md"
           tag: "v${{ steps.date.outputs.tag }}"
           commit: "master"

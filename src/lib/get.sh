@@ -46,13 +46,14 @@ get_discovered() {
 }
 
 get_owners(){
-	git -C "$6" log --name-only --pretty=format:%ct -- . | awk '
+    git -C "$6" log --name-only --pretty=format:%ct -- . 2>/dev/null | awk '
 /^[0-9]+$/ { ts=$0; next }     # commit timestamp line
 NF==0 { next }                 # skip blanks
 index($0,"/")==0 { next }      # skip root-level files
 { split($0,a,"/"); d=a[1]; if(!(d in seen)) seen[d]=ts }
 END { for(d in seen) printf "%s %s\n", seen[d], d }
 ' | sort -n | cut -d' ' -f2- >complete_owners
+
     get_discovered "$2" "$4" "$5" | grep -vFxf all_owners_in_db -
 	get_remaining complete_owners "$2" "$4" "$5" | grep -vFxf all_owners_in_db -
 	rm -f complete_owners
@@ -60,4 +61,4 @@ END { for(d in seen) printf "%s %s\n", seen[d], d }
 	insert_into <(get_remaining owners_partially_updated "$2" "$4" "$5" "$3") <(get_remaining owners_stale "$2" "$4" "$5")
 }
 
-get_owners "$1" "$2" "$3" "$4" "$5" "$6" 2>/dev/null | awk '!seen[$0]++' | head -n $((3 * $3))
+get_owners "$1" "$2" "$3" "$4" "$5" "$6" | awk '!seen[$0]++' | head -n $((4 * $3))
