@@ -26,10 +26,11 @@ jobs:
 
     permissions:
       contents: write
+      packages: read
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@main
 
       - name: Tune dpkg
         uses: abbbi/github-actions-tune@v1

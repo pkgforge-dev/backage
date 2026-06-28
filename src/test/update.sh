@@ -19,6 +19,42 @@ log_update_startup_phase() {
     echo "Update setup phase '$phase' completed in ${elapsed}s"
 }
 
+move_workflow_payload_entry() {
+    local entry=$1
+    local destination=$2
+    local name=${entry##*/}
+    local target="$destination/$name"
+
+    if [ -d "$entry" ] && [ -d "$target" ]; then
+        local -a nested=()
+
+        shopt -s dotglob nullglob
+        nested=("$entry"/*)
+        shopt -u dotglob nullglob
+        ((${#nested[@]} == 0)) || mv "${nested[@]}" "$target"/
+        rmdir "$entry" 2>/dev/null || :
+        return 0
+    fi
+
+    mv "$entry" "$destination"/
+}
+
+import_workflow_payload() {
+    local payload_dir=${1:-.bkg}
+    local destination=${2:-.}
+    local entry
+    local -a entries=()
+
+    [ -d "$payload_dir" ] || return 0
+    mkdir -p "$destination" || return 1
+    shopt -s dotglob nullglob
+    entries=("$payload_dir"/*)
+    shopt -u dotglob nullglob
+    for entry in "${entries[@]}"; do
+        move_workflow_payload_entry "$entry" "$destination" || return 1
+    done
+}
+
 root="$1"
 [[ -n "$root" && ! "${root:0:2}" =~ -(m|d) ]] && shift || root="."
 [ -d "$root" ] || mkdir -p "$root"
@@ -26,15 +62,15 @@ root="$1"
 [ -d "$root/.git" ] || { gh auth status &>/dev/null && gh repo clone "${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}" "$root"  -- --depth=1 -b "$GITHUB_BRANCH" --single-branch || git clone --depth=1 -b "$GITHUB_BRANCH" --single-branch "https://github.com/${GITHUB_OWNER:-ipitio}/${GITHUB_REPO:-backage}.git" "$root"; }
 log_update_startup_phase "ensure-root-repo" "$UPDATE_STARTUP_PHASE_STARTED_AT"
 
-# actions: move db into root
-shopt -s dotglob
-[ ! -d .bkg ] || mv .bkg/* "$root"/
-shopt -u dotglob
+import_workflow_payload .bkg "$root" || {
+    echo "Failed to import workflow payload from .bkg" >&2
+    exit 1
+}
 
-pushd "$root" || exit 1
-pushd src || exit 1
+pushd "$root" >/dev/null || exit 1
+pushd src >/dev/null || exit 1
 source bkg.sh
-popd || exit 1
+popd >/dev/null || exit 1
 
 # permissions
 [ -n "$GITHUB_TOKEN" ] || GITHUB_TOKEN=$(remote_url=$(git config --get remote.origin.url); if grep -q '@' <<<"$remote_url"; then grep -oP '(?<=://)[^@]+' <<<"$remote_url"; else echo ""; fi)
@@ -67,7 +103,6 @@ BKG_BRANCH=$(git branch --show-current 2>/dev/null)
 [ -n "$GITHUB_BRANCH" ] || GITHUB_BRANCH="$BKG_BRANCH"
 BKG_INDEX=$([ "$GITHUB_BRANCH" = "master" ] && echo -n "index" || echo -n "index-${BKG_BRANCH:-}")
 BKG_INDEX_DB=$BKG_ROOT/"$BKG_INDEX".db
-BKG_INDEX_DB_ZST="$BKG_INDEX_DB".zst
 BKG_INDEX_SQL=$BKG_ROOT/"$BKG_INDEX".sql
 BKG_INDEX_DIR=$BKG_ROOT/"$BKG_INDEX"
 set +o allexport
@@ -108,22 +143,35 @@ git worktree add --no-checkout -f "$BKG_INDEX" "$BKG_INDEX"
 log_update_startup_phase "attach-index-worktree" "$WORKTREE_PHASE_STARTED_AT"
 
 WORKTREE_PHASE_STARTED_AT=$(update_startup_phase_started_at)
-pushd "$BKG_INDEX" || exit 1
+pushd "$BKG_INDEX" >/dev/null || exit 1
 index_sparse_set_root
 git reset --hard origin/"$BKG_INDEX"
-popd || exit 1
+popd >/dev/null || exit 1
 [ -f "$BKG_INDEX"/.env ] && \cp "$BKG_INDEX"/.env src/env.env || touch src/env.env
-pushd src || exit 1
+pushd src >/dev/null || exit 1
 log_update_startup_phase "prepare-index-worktree" "$UPDATE_STARTUP_PHASE_STARTED_AT"
 
-if [ ! -f "$BKG_INDEX_DB_ZST" ] && [ ! -f "$BKG_INDEX_SQL".zst ] && [ ! -f "$BKG_INDEX_DB" ]; then
+snapshot_file=$(startup_index_snapshot_archive_file 2>/dev/null || :)
+
+if [ -z "$snapshot_file" ] && [ ! -f "$BKG_INDEX_DB" ]; then
     UPDATE_STARTUP_PHASE_STARTED_AT=$(update_startup_phase_started_at)
-    dldb >/dev/null 2>&1 || true
+    dldb >/dev/null || true
     log_update_startup_phase "download-initial-db" "$UPDATE_STARTUP_PHASE_STARTED_AT"
+    snapshot_file=$(startup_index_snapshot_archive_file 2>/dev/null || :)
 fi
 
-db_size=$(stat -c %s "$BKG_INDEX_DB_ZST" 2>/dev/null || stat -c %s "$BKG_INDEX_SQL".zst 2>/dev/null || stat -c %s "$BKG_INDEX_DB" 2>/dev/null || echo 0)
-num_owner_db=$(sqlite3 "$BKG_INDEX_DB" "SELECT COUNT(DISTINCT owner) FROM $BKG_INDEX_TBL_PKG")
+if [ -n "$snapshot_file" ]; then
+    UPDATE_STARTUP_PHASE_STARTED_AT=$(update_startup_phase_started_at)
+    restore_startup_database_snapshot_if_needed "$snapshot_file" || {
+        echo "Failed to restore the latest database snapshot" >&2
+        [ "$GITHUB_OWNER" != "ipitio" ] || check_db
+        exit 1
+    }
+    log_update_startup_phase "restore-initial-db" "$UPDATE_STARTUP_PHASE_STARTED_AT"
+fi
+
+db_size=$(stat -c %s "$snapshot_file" 2>/dev/null || stat -c %s "$BKG_INDEX_DB" 2>/dev/null || echo 0)
+num_owner_db=$(index_database_owner_count)
 num_owner_index=$(index_top_level_owner_count)
 
 if [ "$GITHUB_OWNER" = "ipitio" ] && ((num_owner_db < num_owner_index/2)) && ((db_size < 100000)); then
@@ -136,18 +184,19 @@ fi
 main "$@"
 return_code=$?
 # db should not be empty, error if it is
-[ "$(stat -c %s "$BKG_INDEX_DB_ZST" 2>/dev/null || stat -c %s "$BKG_INDEX_SQL".zst 2>/dev/null || echo 0)" -ge 100 ] || exit 1
+snapshot_file=$(post_stop_current_index_snapshot_archive_file 2>/dev/null || :)
+[ "$(stat -c %s "$snapshot_file" 2>/dev/null || echo 0)" -ge 100 ] || exit 1
 # files should be valid, warn if not, unless only opted out owners
 #(( return_code == 1 )) || find .. -type f -name '*.json' -o -name '*.xml' | parallel --lb test/index.sh {}
-popd || exit 1
+popd >/dev/null || exit 1
 \cp src/env.env "$BKG_INDEX"/.env
 
 if git worktree list | grep -q "$BKG_INDEX"; then
-    pushd "$BKG_INDEX" || exit 1
+    pushd "$BKG_INDEX" >/dev/null || exit 1
     git add .
     git commit -m "$(date -u +%Y-%m-%d)"
     git push --set-upstream origin "$BKG_INDEX"
-    popd || exit 1
+    popd >/dev/null || exit 1
     ! git worktree list | grep -q "$BKG_INDEX".bak || git worktree remove -f "$BKG_INDEX".bak &>/dev/null
 fi
 
@@ -163,4 +212,4 @@ if ! git diff --cached --quiet; then
 else
     echo "No top-level txt/README changes to commit"
 fi
-popd || exit 1
+popd >/dev/null || exit 1

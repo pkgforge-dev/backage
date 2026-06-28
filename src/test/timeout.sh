@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# shellcheck disable=SC1091,SC2034
+# Test doubles are invoked indirectly by sourced production functions.
+# shellcheck disable=SC1091,SC2034,SC2317
 
 set -euo pipefail
 
@@ -18,6 +19,9 @@ test_parallel_shell_func_timeout_fallback() {
 #!/bin/bash
 
 timeout_worker() {
+	echo 'jq: parse error: Invalid string: control characters from U+0000 through U+001F must be escaped' >&2
+	echo 'GitHub operation exceeded its total timeout' >&2
+	echo 'Docker manifest size fallback for alpha/pkg/1 embedded manifest: malformed JSON; sample="{\"bad\":\"raw \\u0001 control\"}"' >&2
 	return 3
 }
 EOF
@@ -36,6 +40,30 @@ EOF
 	[ "$status" -eq 3 ] || fail "Expected parallel_shell_func to return 3 after timeout, got $status"
 	assert_not_contains "$output_file" "parallel: This job failed:"
 	assert_not_contains "$output_file" "parallel: Starting no more jobs."
+	assert_not_contains "$output_file" "jq: parse error:"
+	assert_not_contains "$output_file" "GitHub operation exceeded its total timeout"
+}
+
+test_parallel_shell_func_timeout_stderr_filter_keeps_manifest_diagnostics() {
+	local stderr_file="$workdir/timeout-stderr-filter.err"
+	local output_file="$workdir/timeout-stderr-filter.out"
+
+	{
+		echo 'parallel: This job failed:'
+		echo 'bash /tmp/parallel-worker.sh /tmp/source worker'
+		echo 'parallel: Starting no more jobs. Waiting for 2 jobs to finish.'
+		echo 'jq: parse error: Invalid string: control characters from U+0000 through U+001F must be escaped'
+		echo 'GitHub operation exceeded its total timeout'
+		printf '%s\n' 'Docker manifest size fallback for alpha/pkg/1 embedded manifest: malformed JSON; sample="{\"bad\":\"raw \\u0001 control\"}"'
+	} >"$stderr_file"
+
+	parallel_shell_func_print_timeout_stderr "$stderr_file" >"$output_file" 2>&1
+
+	assert_not_contains "$output_file" "parallel: This job failed:"
+	assert_not_contains "$output_file" "parallel: Starting no more jobs."
+	assert_not_contains "$output_file" "jq: parse error:"
+	assert_not_contains "$output_file" "GitHub operation exceeded its total timeout"
+	assert_contains "$output_file" "Docker manifest size fallback for alpha/pkg/1 embedded manifest: malformed JSON"
 }
 
 test_curl_stops_retrying_after_timeout() {
@@ -279,55 +307,42 @@ test_parallel_async_wait_kills_blocked_workers_after_timeout() {
 	unset -f blocking_async_worker
 }
 
-test_owner_build_json_array_enforces_elapsed_limit() {
-	local fake_bin="$workdir/fake-owner-array-bin"
-	local fake_jq="$fake_bin/jq"
+test_owner_build_json_array_to_file_enforces_elapsed_limit() {
 	local owner_dir="$workdir/owner-array-elapsed"
 	local output_file="$workdir/owner-array-output.json"
-	local started_file="$workdir/owner-array-jq-started.txt"
-	local original_path="$PATH"
 	local status=0
 	local started_at
 	local elapsed
 	local now
 
-	mkdir -p "$fake_bin" "$owner_dir"
-	cat >"$fake_jq" <<'EOF'
-#!/bin/bash
-printf 'started\n' >"$TEST_OWNER_ARRAY_JQ_STARTED_FILE"
-exec sleep 30
-EOF
-	chmod +x "$fake_jq"
-
+	mkdir -p "$owner_dir"
 	printf '%s\n' '{"id":1,"repo":"repo-one"}' >"$owner_dir/one.json"
 	printf '%s\n' '{"id":2,"repo":"repo-two"}' >"$owner_dir/two.json"
+	printf '%s\n' '{"old":true}' >"$output_file"
 
 	now=$(date -u +%s)
 	BKG_ENV="$workdir/env-owner-array-elapsed.env"
 	: >"$BKG_ENV"
-	set_BKG BKG_SCRIPT_START "$now"
+	set_BKG BKG_SCRIPT_START "$((now - 5))"
 	set_BKG BKG_RATE_LIMIT_START "$now"
 	set_BKG BKG_MIN_RATE_LIMIT_START "$now"
 	set_BKG BKG_CALLS_TO_API 0
 	set_BKG BKG_MIN_CALLS_TO_API 0
 	set_BKG BKG_TIMEOUT 0
 	BKG_MAX_LEN=3
-	TEST_OWNER_ARRAY_JQ_STARTED_FILE="$started_file"
-	export TEST_OWNER_ARRAY_JQ_STARTED_FILE BKG_ENV
-	PATH="$fake_bin:$original_path"
 	started_at=$(date +%s)
 
-	if owner_build_json_array "$owner_dir" >"$output_file" 2>&1; then
-		fail "Expected owner_build_json_array to enforce the elapsed timeout"
+	if owner_build_json_array_to_file "$owner_dir" "$output_file"; then
+		fail "Expected owner_build_json_array_to_file to enforce the elapsed timeout"
 	else
 		status=$?
 	fi
 
-	PATH="$original_path"
 	elapsed=$(( $(date +%s) - started_at ))
-	[ "$status" -eq 3 ] || fail "Expected owner_build_json_array to return 3 after elapsed timeout, got $status"
-	assert_file_exists "$started_file"
-	[ "$elapsed" -lt 10 ] || fail "Expected owner_build_json_array to interrupt long jq aggregation promptly"
+	[ "$status" -eq 3 ] || fail "Expected owner_build_json_array_to_file to return 3 after elapsed timeout, got $status"
+	jq -e '.old == true' "$output_file" >/dev/null || fail "Expected an interrupted owner aggregate to preserve its prior output"
+	[ "$(get_BKG BKG_TIMEOUT)" = "1" ] || fail "Expected Python aggregate interruption to persist BKG_TIMEOUT"
+	[ "$elapsed" -lt 10 ] || fail "Expected owner aggregate rendering to stop promptly after the elapsed limit"
 }
 
 test_owner_update_wait_notice_is_throttled() {
@@ -394,6 +409,8 @@ test_owner_update_force_stop_due_after_grace_period() {
 test_run_owner_updates_halts_on_timeout() {
 	local args_file="$workdir/owner-update.args"
 	local stdin_file="$workdir/owner-update.stdin"
+	local started_at
+	local elapsed
 	local status=0
 
 	get_BKG_set() {
@@ -416,19 +433,46 @@ test_run_owner_updates_halts_on_timeout() {
 	}
 
 	GITHUB_OWNER=ipitio
+	started_at=$(date +%s)
 
 	if run_owner_updates; then
 		fail "Expected run_owner_updates to return 3 when owner workers time out"
 	else
 		status=$?
 	fi
+	elapsed=$(( $(date +%s) - started_at ))
 
 	[ "$status" -eq 3 ] || fail "Expected run_owner_updates to return 3, got $status"
+	[ "$elapsed" -lt 10 ] || fail "Expected run_owner_updates to notice completed workers promptly"
 	assert_contains "$args_file" "update_owner"
 	assert_contains "$args_file" "--halt"
 	assert_contains "$args_file" "soon,fail=1"
 	assert_contains "$stdin_file" "1/alpha"
 	assert_contains "$stdin_file" "2/beta"
+}
+
+test_owner_update_status_keeps_graceful_timeout_publishable() {
+	local output_file="$workdir/owner-timeout-status.out"
+	local status=0
+
+	return_code=0
+	handle_owner_update_status 3 >"$output_file" 2>&1 || status=$?
+
+	[ "$status" -eq 0 ] || fail "Expected graceful owner timeout to keep publishing path available"
+	[ "$return_code" -eq 3 ] || fail "Expected graceful owner timeout to persist return_code 3"
+	assert_contains "$output_file" "Reached BKG_MAX_LEN"
+}
+
+test_owner_update_status_aborts_unexpected_failure() {
+	local output_file="$workdir/owner-failure-status.out"
+	local status=0
+
+	return_code=0
+	handle_owner_update_status 1 >"$output_file" 2>&1 || status=$?
+
+	[ "$status" -eq 1 ] || fail "Expected unexpected owner failure to abort with status 1"
+	[ "$return_code" -eq 0 ] || fail "Expected unexpected owner failure not to mark graceful timeout"
+	assert_contains "$output_file" "stopping before snapshot publication"
 }
 
 test_query_api_checks_elapsed_limit_before_request() {
@@ -446,8 +490,8 @@ test_query_api_checks_elapsed_limit_before_request() {
 	BKG_MAX_LEN=1
 	GITHUB_TOKEN=dummy
 
-	curl_gh() {
-		fail "Expected query_api to stop before calling curl_gh when the elapsed limit is exceeded"
+	bkg_python() {
+		fail "Expected query_api to stop before calling Python when the elapsed limit is exceeded"
 	}
 
 	if query_api "users/example" >/dev/null 2>&1; then
@@ -457,7 +501,7 @@ test_query_api_checks_elapsed_limit_before_request() {
 	fi
 
 	[ "$status" -eq 3 ] || fail "Expected query_api to return 3 after elapsed limit preflight, got $status"
-	unset -f curl_gh
+	unset -f bkg_python
 	GITHUB_TOKEN=""
 }
 
@@ -476,8 +520,8 @@ test_query_graphql_api_checks_elapsed_limit_before_request() {
 	BKG_MAX_LEN=1
 	GITHUB_TOKEN=dummy
 
-	curl_gh() {
-		fail "Expected query_graphql_api to stop before calling curl_gh when the elapsed limit is exceeded"
+	bkg_python() {
+		fail "Expected query_graphql_api to stop before calling Python when the elapsed limit is exceeded"
 	}
 
 	if query_graphql_api 'query { viewer { login } }' >/dev/null 2>&1; then
@@ -487,7 +531,38 @@ test_query_graphql_api_checks_elapsed_limit_before_request() {
 	fi
 
 	[ "$status" -eq 3 ] || fail "Expected query_graphql_api to return 3 after elapsed limit preflight, got $status"
-	unset -f curl_gh
+	unset -f bkg_python
+	GITHUB_TOKEN=""
+}
+
+test_page_owner_checks_elapsed_limit_before_request() {
+	local status=0
+	local now
+
+	now=$(date -u +%s)
+	BKG_ENV="$workdir/env-page-owner-preflight.env"
+	: >"$BKG_ENV"
+	set_BKG BKG_SCRIPT_START "$((now - 5))"
+	set_BKG BKG_RATE_LIMIT_START "$now"
+	set_BKG BKG_MIN_RATE_LIMIT_START "$now"
+	set_BKG BKG_CALLS_TO_API 0
+	set_BKG BKG_MIN_CALLS_TO_API 0
+	BKG_MAX_LEN=1
+	BKG_PAGE_ALL=1
+	GITHUB_TOKEN=dummy
+
+	bkg_python() {
+		fail "Expected page_owner to stop before calling Python when the elapsed limit is exceeded"
+	}
+
+	if page_owner 1 >/dev/null 2>&1; then
+		fail "Expected page_owner to return 3 when the elapsed limit is exceeded before the request starts"
+	else
+		status=$?
+	fi
+
+	[ "$status" -eq 3 ] || fail "Expected page_owner to return 3 after elapsed limit preflight, got $status"
+	unset -f bkg_python
 	GITHUB_TOKEN=""
 }
 
@@ -496,6 +571,7 @@ trap cleanup EXIT
 source_project_script "bkg.sh"
 
 run_test test_parallel_shell_func_timeout_fallback
+run_test test_parallel_shell_func_timeout_stderr_filter_keeps_manifest_diagnostics
 run_test test_curl_stops_retrying_after_timeout
 run_test test_curl_checks_elapsed_limit_before_successful_request
 run_test test_docker_manifest_inspect_stops_after_timeout
@@ -503,11 +579,14 @@ run_test test_ytoxt_stops_after_timeout
 run_test test_run_parallel_kills_blocked_workers_after_timeout
 run_test test_run_parallel_enforces_elapsed_limit_for_blocked_workers
 run_test test_parallel_async_wait_kills_blocked_workers_after_timeout
-run_test test_owner_build_json_array_enforces_elapsed_limit
+run_test test_owner_build_json_array_to_file_enforces_elapsed_limit
 run_test test_owner_update_wait_notice_is_throttled
 run_test test_owner_update_force_stop_due_after_grace_period
 run_test test_run_owner_updates_halts_on_timeout
+run_test test_owner_update_status_keeps_graceful_timeout_publishable
+run_test test_owner_update_status_aborts_unexpected_failure
 run_test test_query_api_checks_elapsed_limit_before_request
 run_test test_query_graphql_api_checks_elapsed_limit_before_request
+run_test test_page_owner_checks_elapsed_limit_before_request
 
 echo "Timeout propagation regression tests passed"

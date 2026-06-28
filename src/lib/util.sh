@@ -1,7 +1,7 @@
 #!/bin/bash
 # Backage library
 # Usage: ./lib.sh
-# Dependencies: git curl jq parallel sqlite3 sqlite3-pcre zstd libxml2-utils, yq
+# Dependencies: git curl jq parallel python3 python3-httpx sqlite3 zstd libxml2-utils docker.io
 # Copyright (c) ipitio
 #
 # shellcheck disable=SC1090,SC1091,SC2015,SC2034
@@ -24,17 +24,10 @@ apt_install() {
     fi
 }
 
-yq_install() {
-    [ ! -f /usr/bin/yq ] || sudonot mv -f /usr/bin/yq /usr/bin/yq.bak
-    sudonot curl -LNZo /usr/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-    sudonot chmod +x /usr/bin/yq
-}
-
 if [ -z "${BKG_UTIL_BOOTSTRAPPED:-}" ]; then
     if [ "${BKG_SKIP_DEP_VERIFY:-0}" != "1" ]; then
         echo "Verifying dependencies..."
-        apt_install git curl jq parallel sqlite3 sqlite3-pcre zstd libxml2-utils
-        yq -V | grep -q mikefarah 2>/dev/null || yq_install
+        apt_install git curl jq parallel python3 python3-httpx sqlite3 zstd libxml2-utils docker.io
         echo "Dependencies verified!"
     fi
 
@@ -42,7 +35,11 @@ if [ -z "${BKG_UTIL_BOOTSTRAPPED:-}" ]; then
 fi
 GITHUB_OWNER=${GITHUB_OWNER:-ipitio}
 GITHUB_REPO=${GITHUB_REPO:-backage}
-BKG_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+BKG_ROOT="$(
+    cd -P "$(dirname "${BASH_SOURCE[0]}")" &&
+        cd ../.. &&
+        pwd -P
+)"
 BKG_ENV=${BKG_ENV:-$BKG_ROOT/src/env.env}
 BKG_OWNERS=${BKG_OWNERS:-$BKG_ROOT/owners.txt}
 BKG_OPTOUT=${BKG_OPTOUT:-$BKG_ROOT/optout.txt}
@@ -53,6 +50,9 @@ BKG_MODE=${BKG_MODE:-0}
 BKG_MAX_LEN=${BKG_MAX_LEN:-14400}
 BKG_IS_FIRST=${BKG_IS_FIRST:-false}
 BKG_PAGE_ALL=${BKG_PAGE_ALL:-1}
+BKG_OWNER_NOT_FOUND_STATUS=4
+BKG_OWNER_RETRY_INITIAL_SECONDS=${BKG_OWNER_RETRY_INITIAL_SECONDS:-3600}
+BKG_OWNER_RETRY_MAX_SECONDS=${BKG_OWNER_RETRY_MAX_SECONDS:-86400}
 
 # format numbers like 1000 to 1k
 numfmt() {
@@ -63,28 +63,6 @@ numfmt() {
 numfmt_size() {
     # use sed to remove trailing \s*$
     awk '{ split("kB MB GB TB PB EB ZB YB", v); s=0; while( $1>999.9 ) { $1/=1000; s++ } print int($1*10)/10 " " v[s] }' | sed 's/[[:blank:]]*$//'
-}
-
-fmtmetric_num() {
-    awk '
-    {
-        value = $0
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-        gsub(/,/, "", value)
-        if (value == "") next
-
-        suffix = substr(value, length(value), 1)
-        power = 0
-        if (suffix ~ /[[:alpha:]]/) {
-            value = substr(value, 1, length(value) - 1)
-            suffix = toupper(suffix)
-            power = index("KMBTPEZY", suffix)
-            if (power == 0) next
-        }
-
-        if (value !~ /^[0-9]+(\.[0-9]+)?$/) next
-        printf "%.0f", value * (1000 ^ power)
-    }'
 }
 
 fmtsize_num() {
@@ -102,35 +80,27 @@ fmtsize_num() {
 }
 
 db_snapshot_archive_file() {
-    [ -n "${BKG_INDEX_DB:-}" ] || return 1
-    printf '%s\n' "$(dirname "$BKG_INDEX_DB")/.snapshot/$(basename "$BKG_INDEX_DB")"
+    bkg_python snapshot path db
 }
 
 legacy_db_snapshot_archive_file() {
-    [ -n "${BKG_INDEX_DB:-}" ] || return 1
-    printf '%s\n' "${BKG_INDEX_DB}.zst"
+    bkg_python snapshot path db-zst
 }
 
 legacy_sql_snapshot_archive_file() {
-    if [ -n "${BKG_INDEX_SQL:-}" ]; then
-        printf '%s.zst\n' "$BKG_INDEX_SQL"
-    elif [ -n "${BKG_INDEX_DB:-}" ]; then
-        printf '%s.sql.zst\n' "${BKG_INDEX_DB%.db}"
-    else
-        return 1
-    fi
+    bkg_python snapshot path sql-zst
 }
 
 db_snapshot_asset_name() {
-    basename "$(db_snapshot_archive_file)"
+    bkg_python snapshot asset-name db
 }
 
 legacy_db_snapshot_asset_name() {
-    basename "$(legacy_db_snapshot_archive_file)"
+    bkg_python snapshot asset-name db-zst
 }
 
 legacy_sql_snapshot_asset_name() {
-    basename "$(legacy_sql_snapshot_archive_file)"
+    bkg_python snapshot asset-name sql-zst
 }
 
 resolve_release_snapshot_asset() {
@@ -142,21 +112,21 @@ resolve_release_snapshot_asset() {
 
     db_asset_name=$(db_snapshot_asset_name 2>/dev/null || echo "index.db")
     status_code=$(curl -o /dev/null --silent -Iw '%{http_code}' "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download/$latest/$db_asset_name")
-    if [ "$status_code" != "404" ]; then
+    if [[ "$status_code" =~ ^[23][0-9][0-9]$ ]]; then
         printf 'db|%s\n' "$db_asset_name"
         return 0
     fi
 
     legacy_db_asset_name=$(legacy_db_snapshot_asset_name 2>/dev/null || echo "index.db.zst")
     status_code=$(curl -o /dev/null --silent -Iw '%{http_code}' "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download/$latest/$legacy_db_asset_name")
-    if [ "$status_code" != "404" ]; then
+    if [[ "$status_code" =~ ^[23][0-9][0-9]$ ]]; then
         printf 'db-zst|%s\n' "$legacy_db_asset_name"
         return 0
     fi
 
     legacy_asset_name=$(legacy_sql_snapshot_asset_name 2>/dev/null || echo "index.sql.zst")
     status_code=$(curl -o /dev/null --silent -Iw '%{http_code}' "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download/$latest/$legacy_asset_name")
-    if [ "$status_code" != "404" ]; then
+    if [[ "$status_code" =~ ^[23][0-9][0-9]$ ]]; then
         printf 'sql|%s\n' "$legacy_asset_name"
         return 0
     fi
@@ -232,7 +202,6 @@ sqlite3() {
     cat >"$init_file" <<EOF
 .output /dev/null
 .timeout $busy_timeout_ms
-.load /usr/lib/sqlite3/pcre.so
 PRAGMA busy_timeout = $busy_timeout_ms;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
@@ -288,68 +257,79 @@ sqlite_quote_identifier() {
     printf '"%s"' "$(sqlite_escape_identifier "$1")"
 }
 
+bkg_python() {
+    local -a python_env=(
+        "GITHUB_OWNER=$GITHUB_OWNER"
+        "GITHUB_REPO=$GITHUB_REPO"
+        "GITHUB_TOKEN=${GITHUB_TOKEN:-}"
+        "BKG_ROOT=$BKG_ROOT"
+        "BKG_ENV=$BKG_ENV"
+        "BKG_OWNERS=$BKG_OWNERS"
+        "BKG_OPTOUT=$BKG_OPTOUT"
+        "BKG_MODE=$BKG_MODE"
+        "BKG_MAX_LEN=$BKG_MAX_LEN"
+        "BKG_IS_FIRST=$BKG_IS_FIRST"
+        "BKG_PAGE_ALL=$BKG_PAGE_ALL"
+        "BKG_INDEX_DB=${BKG_INDEX_DB:-}"
+        "BKG_INDEX_TBL_OWN=$BKG_INDEX_TBL_OWN"
+        "BKG_INDEX_TBL_PKG=$BKG_INDEX_TBL_PKG"
+        "BKG_INDEX_TBL_VER=$BKG_INDEX_TBL_VER"
+        "BKG_SQLITE_BUSY_TIMEOUT_MS=${BKG_SQLITE_BUSY_TIMEOUT_MS:-300000}"
+        "BKG_SQLITE_MAX_ATTEMPTS=${BKG_SQLITE_MAX_ATTEMPTS:-3}"
+        "BKG_SQLITE_RETRY_DELAY_SECS=${BKG_SQLITE_RETRY_DELAY_SECS:-1}"
+        "BKG_OWNER_RETRY_INITIAL_SECONDS=$BKG_OWNER_RETRY_INITIAL_SECONDS"
+        "BKG_OWNER_RETRY_MAX_SECONDS=$BKG_OWNER_RETRY_MAX_SECONDS"
+        "PYTHONDONTWRITEBYTECODE=1"
+        "PYTHONPATH=$BKG_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+    )
+    local name
+    local python_bin=${BKG_PYTHON:-}
+
+    if [ -z "$python_bin" ] && [ -x "$BKG_ROOT/.venv/bin/python" ]; then
+        python_bin="$BKG_ROOT/.venv/bin/python"
+    fi
+    [ -n "$python_bin" ] || python_bin=python3
+
+    for name in \
+        GITHUB_BRANCH \
+        BKG_INDEX \
+        BKG_INDEX_SQL \
+        BKG_INDEX_DIR \
+        BKG_GITHUB_API_URL \
+        BKG_HTTP_CONNECT_TIMEOUT \
+        BKG_HTTP_READ_TIMEOUT \
+        BKG_HTTP_WRITE_TIMEOUT \
+        BKG_HTTP_POOL_TIMEOUT \
+        BKG_HTTP_TOTAL_TIMEOUT \
+        BKG_HTTP_MAX_ATTEMPTS \
+        BKG_HTTP_INITIAL_BACKOFF \
+        BKG_HTTP_MAX_BACKOFF \
+        BKG_HTTP_USER_AGENT \
+        BKG_OWNER_ID_CACHE \
+        BKG_MAX_VERSION_PAGES \
+        BKG_TAG_CACHE_PAGES \
+        BKG_APPEND_TAGGED_VERSIONS_LIMIT \
+        BKG_PARALLEL_ASYNC_MAX_JOBS \
+        BKG_OWNER_UPDATE_STOP_GRACE \
+        BKG_OWNER_ARRAY_VERSION_LIMIT \
+        BKG_OWNER_ARRAY_MAX_BYTES \
+        BKG_OWNER_ARRAY_ADAPTIVE_MAX_PROBE \
+        BKG_OWNER_ARRAY_DB_ESTIMATE_HEADROOM_PERCENT \
+        BKG_OWNER_ARRAY_DB_FALLBACK_VERSION_LIMIT \
+        BKG_OWNER_ARRAY_DB_VERSION_LIMIT; do
+        [ -z "${!name+x}" ] || python_env+=("$name=${!name}")
+    done
+
+    env "${python_env[@]}" "$python_bin" -m bkg_py "$@"
+}
+
 sqlite_ensure_index_schema() {
     [ -n "${BKG_INDEX_DB:-}" ] || return 1
     local schema_key="${BKG_INDEX_DB}|${BKG_INDEX_TBL_OWN}|${BKG_INDEX_TBL_PKG}|${BKG_INDEX_TBL_VER}"
-    local owners_table_sql
-    local packages_table_sql
-    local versions_table_sql
 
     [ "${BKG_INDEX_SCHEMA_READY_FOR:-}" != "$schema_key" ] || return 0
 
-    owners_table_sql=$(sqlite_quote_identifier "$BKG_INDEX_TBL_OWN")
-    packages_table_sql=$(sqlite_quote_identifier "$BKG_INDEX_TBL_PKG")
-    versions_table_sql=$(sqlite_quote_identifier "$BKG_INDEX_TBL_VER")
-
-    sqlite3 "$BKG_INDEX_DB" "
-        create table if not exists $owners_table_sql (
-            owner_id text not null,
-            owner text not null,
-            date text not null,
-            primary key (owner_id, date)
-        );
-        create table if not exists $packages_table_sql (
-            owner_id text,
-            owner_type text not null,
-            package_type text not null,
-            owner text not null,
-            repo text not null,
-            package text not null,
-            downloads integer not null,
-            downloads_month integer not null,
-            downloads_week integer not null,
-            downloads_day integer not null,
-            size integer not null,
-            date text not null,
-            primary key (owner_id, package, date)
-        );
-        create table if not exists $versions_table_sql (
-            owner_id text not null,
-            owner_type text not null,
-            package_type text not null,
-            owner text not null,
-            repo text not null,
-            package text not null,
-            id text not null,
-            name text not null,
-            size integer not null,
-            downloads integer not null,
-            downloads_month integer not null,
-            downloads_week integer not null,
-            downloads_day integer not null,
-            date text not null,
-            tags text,
-            primary key (owner_id, package_type, repo, package, id, date)
-        );
-        create index if not exists \"idx_bkg_owners_date_owner\" on $owners_table_sql (date, owner);
-        create index if not exists \"idx_bkg_packages_owner_repo_package_date\" on $packages_table_sql (owner_id, owner, repo, package, date);
-        create index if not exists \"idx_bkg_packages_owner_name_date\" on $packages_table_sql (owner_id, owner, date);
-        create index if not exists \"idx_bkg_packages_owner_date_downloads\" on $packages_table_sql (owner_id, date, downloads desc, package);
-        create index if not exists \"idx_bkg_packages_owner_repo_date_downloads\" on $packages_table_sql (owner_id, repo, date, downloads desc, package);
-        create index if not exists \"idx_bkg_versions_package_date\" on $versions_table_sql (owner_id, package_type, repo, package, date);
-        create index if not exists \"idx_bkg_versions_date\" on $versions_table_sql (date);
-        pragma auto_vacuum = full;
-    " || return $?
+    bkg_python database ensure-schema || return $?
     BKG_INDEX_SCHEMA_READY_FOR=$schema_key
 }
 
@@ -357,11 +337,11 @@ cleanup_generated_json_sidecars() {
     [ -n "$1" ] || return
     [ -e "$1" ] || return 0
 
-    find "$1" -type f \( \
+    find "$1" -ignore_readdir_race -type f \( \
         -name '*.json.tmp' -o -name '*.json.tmp.*' -o \
         -name '*.json.abs' -o -name '*.json.abs.*' -o \
         -name '*.json.rel' -o -name '*.json.rel.*' \
-    \) -delete
+    \) -delete 2>/dev/null || return 0
 }
 
 ytoxt_script_path() {
@@ -557,6 +537,17 @@ sleep_with_stop_check() {
     done
 }
 
+background_job_running() {
+    local pid=$1
+    local job_pid
+
+    [ -n "$pid" ] || return 1
+    while IFS= read -r job_pid; do
+        [ "$job_pid" = "$pid" ] && return 0
+    done < <(jobs -pr)
+    return 1
+}
+
 run_command_with_stop_check() {
     local combine_output=false
     local stdout_file
@@ -576,7 +567,7 @@ run_command_with_stop_check() {
     "$@" >"$stdout_file" 2>"$stderr_file" &
     pid=$!
 
-    while kill -0 "$pid" 2>/dev/null; do
+    while background_job_running "$pid"; do
         check_script_timeout
         status=$?
 
@@ -617,7 +608,7 @@ run_command_to_file_with_stop_check() {
     "$@" >"$output_file" 2>"$stderr_file" &
     pid=$!
 
-    while kill -0 "$pid" 2>/dev/null; do
+    while background_job_running "$pid"; do
         check_script_timeout
         status=$?
 
@@ -730,11 +721,12 @@ docker_manifest_inspect() {
     local manifest
     local status
 
+    command -v docker >/dev/null 2>&1 || return 0
     manifest=$(run_command_with_stop_check --combine-output docker_manifest_inspect_once "$1")
     status=$?
     ((status != 3)) || return 3
+    ((status == 0)) || return 0
     echo "$manifest"
-    return "$status"
 }
 
 # shellcheck disable=SC2120
@@ -892,6 +884,16 @@ run_parallel() {
     ! grep -q "3" <<<"$code" || return 3
 }
 
+parallel_shell_func_print_timeout_stderr() {
+    grep -Ev \
+        -e '^parallel: This job failed:$' \
+        -e '^bash .*/parallel-worker\.sh .*$' \
+        -e '^parallel: Starting no more jobs\. Waiting for [0-9]+ jobs to finish\.$' \
+        -e '^jq: parse error:' \
+        -e '^GitHub operation exceeded its total timeout$' \
+        "$1" >&2 || :
+}
+
 parallel_shell_func() {
     [ -n "$1" ] || return
     [ -n "$2" ] || return
@@ -925,7 +927,7 @@ parallel_shell_func() {
     fi
 
     if ((status == 2 || status == 3)) && [ "$(get_BKG BKG_TIMEOUT)" = "1" ]; then
-        grep -Ev '^parallel: This job failed:$|^bash .*/parallel-worker\.sh .*$|^parallel: Starting no more jobs\. Waiting for [0-9]+ jobs to finish\.$' "$stderr_file" >&2 || :
+        parallel_shell_func_print_timeout_stderr "$stderr_file"
         rm -f "$stderr_file" "$stdin_file"
         return 3
     fi
@@ -1058,145 +1060,48 @@ _jq() {
 }
 
 dldb() {
-    local latest=${1:-$(curl "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest" | grep -oP "href=\"/${GITHUB_OWNER}/${GITHUB_REPO}/releases/tag/[^\"]+" | cut -d'/' -f6)}
-    local asset_info
-    local asset_kind
-    local asset_name
-    local asset_url
-    local db_archive_file
-    local legacy_archive_file
-    local db_tmp=""
-    local archive_tmp=""
+    local latest=${1:-}
+    local -a args=(snapshot download-release)
+    local status
 
-    asset_info=$(resolve_release_snapshot_asset "$latest") || return 1
-    asset_kind=$(cut -d'|' -f1 <<<"$asset_info")
-    asset_name=$(cut -d'|' -f2 <<<"$asset_info")
-    asset_url="https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/download/$latest/$asset_name"
-    [ -z "$2" ] || return 0
+    [ -z "$latest" ] || args+=("$latest")
+    [ -z "${2:-}" ] || args+=("--check")
+    if [ -n "${2:-}" ]; then
+        bkg_python "${args[@]}" >/dev/null
+        return $?
+    fi
     echo "Downloading the latest database..."
     # `cd src ; source bkg.sh && dldb` to dl the latest db
-    [ ! -f "$BKG_INDEX_DB" ] || mv "$BKG_INDEX_DB" "$BKG_INDEX_DB".bak
-
-    if [ "$asset_kind" = "db" ]; then
-        db_archive_file=$(db_snapshot_archive_file)
-        mkdir -p "$(dirname "$db_archive_file")" || return 1
-        archive_tmp=$(mktemp "$(dirname "$db_archive_file")/.${db_archive_file##*/}.XXXXXX") || return 1
-        db_tmp=$(mktemp "$(dirname "$BKG_INDEX_DB")/.${BKG_INDEX_DB##*/}.XXXXXX") || {
-            rm -f "$archive_tmp"
-            return 1
-        }
-
-        if command curl -sSLNZ "$asset_url" -o "$archive_tmp" && cp -f "$archive_tmp" "$db_tmp"; then
-            mv -f "$db_tmp" "$BKG_INDEX_DB"
-            mv -f "$archive_tmp" "$db_archive_file"
-            legacy_archive_file=$(legacy_db_snapshot_archive_file 2>/dev/null || :)
-            [ -z "$legacy_archive_file" ] || rm -f "$legacy_archive_file"
-            legacy_archive_file=$(legacy_sql_snapshot_archive_file 2>/dev/null || :)
-            [ -z "$legacy_archive_file" ] || rm -f "$legacy_archive_file"
-            if command -v db_restore_signature_file >/dev/null 2>&1; then
-                sha256sum "$db_archive_file" | awk '{print $1}' >"$(db_restore_signature_file)"
-            fi
-        else
-            rm -f "$db_tmp" "$archive_tmp"
-        fi
-    elif [ "$asset_kind" = "db-zst" ]; then
-        db_archive_file=$(legacy_db_snapshot_archive_file)
-        archive_tmp=$(mktemp "$(dirname "$db_archive_file")/.${db_archive_file##*/}.XXXXXX") || return 1
-        db_tmp=$(mktemp "$(dirname "$BKG_INDEX_DB")/.${BKG_INDEX_DB##*/}.XXXXXX") || {
-            rm -f "$archive_tmp"
-            return 1
-        }
-
-        if command curl -sSLNZ "$asset_url" -o "$archive_tmp" && unzstd -c "$archive_tmp" >"$db_tmp"; then
-            mv -f "$db_tmp" "$BKG_INDEX_DB"
-            mv -f "$archive_tmp" "$db_archive_file"
-            legacy_archive_file=$(legacy_sql_snapshot_archive_file 2>/dev/null || :)
-            [ -z "$legacy_archive_file" ] || rm -f "$legacy_archive_file"
-            if command -v db_restore_signature_file >/dev/null 2>&1; then
-                sha256sum "$db_archive_file" | awk '{print $1}' >"$(db_restore_signature_file)"
-            fi
-        else
-            rm -f "$db_tmp" "$archive_tmp"
-        fi
-    else
-        command curl -sSLNZ "$asset_url" | unzstd -v -c | command sqlite3 "$BKG_INDEX_DB"
-    fi
-
-    if [ -f "$BKG_INDEX_DB" ]; then
-        [ ! -f "$BKG_INDEX_DB".bak ] || rm -f "$BKG_INDEX_DB".bak
-    else
-        [ ! -f "$BKG_INDEX_DB".bak ] || mv "$BKG_INDEX_DB".bak "$BKG_INDEX_DB"
+    bkg_python "${args[@]}"
+    status=$?
+    if ((status != 0)); then
         echo "Failed to get the latest database"
     fi
 
-    [ -f "$BKG_ROOT/.gitignore" ] || echo "*.db*" >>$BKG_ROOT/.gitignore
-    grep -q "\*.db" "$BKG_ROOT/.gitignore" || echo "*.db*" >>$BKG_ROOT/.gitignore
+    [ -f "$BKG_ROOT/.gitignore" ] || echo "*.db*" >>"$BKG_ROOT/.gitignore"
+    grep -q "\*.db" "$BKG_ROOT/.gitignore" || echo "*.db*" >>"$BKG_ROOT/.gitignore"
+    return "$status"
 }
 
-curl_gh() {
-    curl -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $GITHUB_TOKEN" -H "X-GitHub-Api-Version: 2022-11-28" "$@"
+curl_gh_direct() {
+    command curl -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $GITHUB_TOKEN" -H "X-GitHub-Api-Version: 2022-11-28" "$@"
 }
 
 query_api() {
-    local res
-    local calls_to_api
-    local min_calls_to_api
-
     check_limit || return $?
-    res=$(curl_gh "https://api.github.com/$1")
-    (($? != 3)) || return 3
-    calls_to_api=$(get_BKG BKG_CALLS_TO_API)
-    min_calls_to_api=$(get_BKG BKG_MIN_CALLS_TO_API)
-    ((calls_to_api++))
-    ((min_calls_to_api++))
-    set_BKG BKG_CALLS_TO_API "$calls_to_api"
-    set_BKG BKG_MIN_CALLS_TO_API "$min_calls_to_api"
-    echo "$res"
+    bkg_python github rest "$1"
 }
 
-graphql_query_with_rate_limit() {
-    [ -n "$1" ] || return
-
-    if grep -q 'rateLimit' <<<"$1"; then
-        printf '%s\n' "$1"
-        return 0
-    fi
-
-    perl -0pe 's/\}\s*$/ rateLimit { cost remaining resetAt } }/' <<<"$1"
+query_api_optional() {
+    check_limit || return $?
+    bkg_python github rest "$1" --missing-ok
 }
 
 query_graphql_api() {
     local query=$1
-    local query_with_rate_limit
-    local payload
-    local res
-    local calls_to_api
-    local min_calls_to_api
-    local graphql_cost=1
-    local graphql_remaining=""
-    local graphql_reset_at=""
 
-    query_with_rate_limit=$(graphql_query_with_rate_limit "$query") || return 1
-    payload=$(jq -cn --arg query "$query_with_rate_limit" '{query:$query}') || return 1
     check_limit || return $?
-    res=$(curl_gh -X POST "https://api.github.com/graphql" -d "$payload")
-    (($? != 3)) || return 3
-    graphql_cost=$(jq -r '.data.rateLimit.cost // 1' <<<"$res" 2>/dev/null)
-    [[ "$graphql_cost" =~ ^[0-9]+$ ]] || graphql_cost=1
-    graphql_remaining=$(jq -r '.data.rateLimit.remaining // empty' <<<"$res" 2>/dev/null)
-    graphql_reset_at=$(jq -r '.data.rateLimit.resetAt // empty' <<<"$res" 2>/dev/null)
-    calls_to_api=$(get_BKG BKG_CALLS_TO_API)
-    min_calls_to_api=$(get_BKG BKG_MIN_CALLS_TO_API)
-    [ -n "$calls_to_api" ] || calls_to_api=0
-    [ -n "$min_calls_to_api" ] || min_calls_to_api=0
-    ((calls_to_api += graphql_cost))
-    ((min_calls_to_api += graphql_cost))
-    set_BKG BKG_CALLS_TO_API "$calls_to_api"
-    set_BKG BKG_MIN_CALLS_TO_API "$min_calls_to_api"
-    set_BKG BKG_GRAPHQL_LAST_COST "$graphql_cost"
-    [[ "$graphql_remaining" =~ ^[0-9]+$ ]] && set_BKG BKG_GRAPHQL_REMAINING "$graphql_remaining"
-    [ -n "$graphql_reset_at" ] && set_BKG BKG_GRAPHQL_RESET_AT "$graphql_reset_at"
-    echo "$res"
+    printf '%s' "$query" | bkg_python github graphql
 }
 
 graphql_escape_string() {
@@ -1282,19 +1187,36 @@ cache_owner_ref() {
 
 graphql_owner_type() {
     [ -n "$1" ] || return
-    local owner_login
-    local response
-
-    owner_login=$(owner_ref_login "$1") || return 1
-    response=$(query_graphql_api "query { owner: repositoryOwner(login:\"$(graphql_escape_string "$owner_login")\") { __typename } }")
-    (($? != 3)) || return 3
-    jq -r '.data.owner.__typename // empty' <<<"$response"
+    bkg_python discovery owner-type "$1"
 }
 
 graphql_discovery_reset_page_info() {
     GRAPHQL_DISCOVERY_HAS_NEXT_PAGE=false
     GRAPHQL_DISCOVERY_END_CURSOR=""
     GRAPHQL_DISCOVERY_NODES=""
+}
+
+graphql_discovery_read_page() {
+    local output=$1
+    local key
+    local value
+    local nodes=""
+
+    graphql_discovery_reset_page_info
+    while IFS=$'\t' read -r key value; do
+        case "$key" in
+        has_next)
+            GRAPHQL_DISCOVERY_HAS_NEXT_PAGE=$value
+            ;;
+        end_cursor)
+            GRAPHQL_DISCOVERY_END_CURSOR=$value
+            ;;
+        node)
+            nodes="${nodes:+$nodes$'\n'}$value"
+            ;;
+        esac
+    done <<<"$output"
+    GRAPHQL_DISCOVERY_NODES=$nodes
 }
 
 graphql_repo_discovery_nodes() {
@@ -1305,53 +1227,19 @@ graphql_repo_discovery_nodes() {
     local cursor=${3:-}
     local owner
     local repo
-    local after_arg=""
-    local query
-    local response
-    local parsed_nodes=""
+    local output
+    local status=0
 
     owner=$(cut -d'/' -f1 <<<"$node")
     repo=$(cut -d'/' -f2- <<<"$node")
     [ -n "$owner" ] || return 1
     [ -n "$repo" ] || return 1
     graphql_discovery_reset_page_info
-    [ -z "$cursor" ] || after_arg=", after:\"$(graphql_escape_string "$cursor")\""
 
-    case "$edge" in
-    stargazers|watchers)
-        query="query { repository(owner:\"$(graphql_escape_string "$owner")\", name:\"$(graphql_escape_string "$repo")\") { $edge(first:100$after_arg) { nodes { login databaseId } pageInfo { hasNextPage endCursor } } } }"
-        response=$(query_graphql_api "$query")
-        (($? != 3)) || return 3
-        GRAPHQL_DISCOVERY_HAS_NEXT_PAGE=$(jq -r ".data.repository.$edge.pageInfo.hasNextPage // false" <<<"$response" 2>/dev/null)
-        GRAPHQL_DISCOVERY_END_CURSOR=$(jq -r ".data.repository.$edge.pageInfo.endCursor // empty" <<<"$response" 2>/dev/null)
-        while IFS=$'\t' read -r owner_login owner_id; do
-            [ -n "$owner_login" ] || continue
-            [[ "$owner_id" =~ ^[1-9][0-9]*$ ]] || continue
-            cache_owner_ref "$owner_id/$owner_login"
-        done < <(jq -r ".data.repository.$edge.nodes[]? | select(.login != null and .databaseId != null) | \"\(.login)\t\(.databaseId)\"" <<<"$response" 2>/dev/null)
-        parsed_nodes=$(jq -r ".data.repository.$edge.nodes[]? | select(.login != null) | .login" <<<"$response" 2>/dev/null)
-        GRAPHQL_DISCOVERY_NODES=$parsed_nodes
-        return 0
-        ;;
-    forks)
-        query="query { repository(owner:\"$(graphql_escape_string "$owner")\", name:\"$(graphql_escape_string "$repo")\") { forks(first:100$after_arg) { nodes { owner { login ... on User { databaseId } ... on Organization { databaseId } } } pageInfo { hasNextPage endCursor } } } }"
-        response=$(query_graphql_api "$query")
-        (($? != 3)) || return 3
-        GRAPHQL_DISCOVERY_HAS_NEXT_PAGE=$(jq -r '.data.repository.forks.pageInfo.hasNextPage // false' <<<"$response" 2>/dev/null)
-        GRAPHQL_DISCOVERY_END_CURSOR=$(jq -r '.data.repository.forks.pageInfo.endCursor // empty' <<<"$response" 2>/dev/null)
-        while IFS=$'\t' read -r owner_login owner_id; do
-            [ -n "$owner_login" ] || continue
-            [[ "$owner_id" =~ ^[1-9][0-9]*$ ]] || continue
-            cache_owner_ref "$owner_id/$owner_login"
-        done < <(jq -r '.data.repository.forks.nodes[]? | select(.owner.login != null and .owner.databaseId != null) | "\(.owner.login)\t\(.owner.databaseId)"' <<<"$response" 2>/dev/null)
-        parsed_nodes=$(jq -r '.data.repository.forks.nodes[]? | .owner.login // empty' <<<"$response" 2>/dev/null)
-        GRAPHQL_DISCOVERY_NODES=$parsed_nodes
-        return 0
-        ;;
-    *)
-        return 1
-        ;;
-    esac
+    output=$(bkg_python discovery repo-nodes "$owner" "$repo" "$edge" "$cursor") || status=$?
+    ((status != 3)) || return 3
+    ((status == 0)) || return "$status"
+    graphql_discovery_read_page "$output"
 }
 
 graphql_owner_discovery_nodes() {
@@ -1362,113 +1250,95 @@ graphql_owner_discovery_nodes() {
     local cursor=${3:-}
     local owner_type=${4:-}
     local owner_login
-    local after_arg=""
-    local query
-    local response
-    local connection_name=""
-    local parsed_nodes=""
+    local output
+    local status=0
 
     owner_login=$(owner_ref_login "$owner_ref") || return 1
     [ -n "$owner_type" ] || owner_type=$(graphql_owner_type "$owner_login")
-    (($? != 3)) || return 3
+    status=$?
+    ((status != 3)) || return 3
+    ((status == 0)) || return "$status"
     [ -n "$owner_type" ] || return 1
     graphql_discovery_reset_page_info
-    [ -z "$cursor" ] || after_arg=", after:\"$(graphql_escape_string "$cursor")\""
 
-    case "$edge" in
-    followers|following|organizations)
-        [ "$owner_type" = "User" ] || return 0
-        connection_name=$edge
-        query="query { owner: repositoryOwner(login:\"$(graphql_escape_string "$owner_login")\") { ... on User { $connection_name(first:100$after_arg) { nodes { login databaseId } pageInfo { hasNextPage endCursor } } } } }"
-        response=$(query_graphql_api "$query")
-        (($? != 3)) || return 3
-        GRAPHQL_DISCOVERY_HAS_NEXT_PAGE=$(jq -r ".data.owner.$connection_name.pageInfo.hasNextPage // false" <<<"$response" 2>/dev/null)
-        GRAPHQL_DISCOVERY_END_CURSOR=$(jq -r ".data.owner.$connection_name.pageInfo.endCursor // empty" <<<"$response" 2>/dev/null)
-        while IFS=$'\t' read -r ref_login ref_id; do
-            [ -n "$ref_login" ] || continue
-            [[ "$ref_id" =~ ^[1-9][0-9]*$ ]] || continue
-            cache_owner_ref "$ref_id/$ref_login"
-        done < <(jq -r ".data.owner.$connection_name.nodes[]? | select(.login != null and .databaseId != null) | \"\(.login)\t\(.databaseId)\"" <<<"$response" 2>/dev/null)
-        parsed_nodes=$(jq -r ".data.owner.$connection_name.nodes[]? | select(.login != null) | .login" <<<"$response" 2>/dev/null)
-        GRAPHQL_DISCOVERY_NODES=$parsed_nodes
-        return 0
-        ;;
-    people)
-        [ "$owner_type" = "Organization" ] || return 0
-        query="query { owner: repositoryOwner(login:\"$(graphql_escape_string "$owner_login")\") { ... on Organization { membersWithRole(first:100$after_arg) { nodes { login databaseId } pageInfo { hasNextPage endCursor } } } } }"
-        response=$(query_graphql_api "$query")
-        (($? != 3)) || return 3
-        GRAPHQL_DISCOVERY_HAS_NEXT_PAGE=$(jq -r '.data.owner.membersWithRole.pageInfo.hasNextPage // false' <<<"$response" 2>/dev/null)
-        GRAPHQL_DISCOVERY_END_CURSOR=$(jq -r '.data.owner.membersWithRole.pageInfo.endCursor // empty' <<<"$response" 2>/dev/null)
-        while IFS=$'\t' read -r ref_login ref_id; do
-            [ -n "$ref_login" ] || continue
-            [[ "$ref_id" =~ ^[1-9][0-9]*$ ]] || continue
-            cache_owner_ref "$ref_id/$ref_login"
-        done < <(jq -r '.data.owner.membersWithRole.nodes[]? | select(.login != null and .databaseId != null) | "\(.login)\t\(.databaseId)"' <<<"$response" 2>/dev/null)
-        parsed_nodes=$(jq -r '.data.owner.membersWithRole.nodes[]? | select(.login != null) | .login' <<<"$response" 2>/dev/null)
-        GRAPHQL_DISCOVERY_NODES=$parsed_nodes
-        return 0
-        ;;
-    *)
-        return 1
-        ;;
-    esac
+    output=$(bkg_python discovery owner-nodes "$owner_login" "$edge" "$cursor" "$owner_type") || status=$?
+    ((status != 3)) || return 3
+    ((status == 0)) || return "$status"
+    graphql_discovery_read_page "$output"
+}
+
+release_has_snapshot_asset() {
+    local release=$1
+    local db_asset_name
+    local legacy_db_asset_name
+    local legacy_sql_asset_name
+
+    db_asset_name=$(db_snapshot_asset_name 2>/dev/null || echo "index.db")
+    legacy_db_asset_name=$(legacy_db_snapshot_asset_name 2>/dev/null || echo "index.db.zst")
+    legacy_sql_asset_name=$(legacy_sql_snapshot_asset_name 2>/dev/null || echo "index.sql.zst")
+
+    jq -e \
+        --arg db "$db_asset_name" \
+        --arg legacy_db "$legacy_db_asset_name" \
+        --arg legacy_sql "$legacy_sql_asset_name" \
+        'any(.assets[]?; .name == $db or .name == $legacy_db or .name == $legacy_sql)' \
+        <<<"$release" >/dev/null 2>&1
 }
 
 check_db() {
     local release
+    local release_id
     local latest
-    release=$(query_api "repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest")
-    latest=$(jq -r '.tag_name' <<<"$release")
 
-    until dldb "$latest" "1"; do
+    while true; do
+        release=$(curl_gh_direct --fail-with-body --silent --show-error "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest") || {
+            echo "Failed to get the latest release metadata" >&2
+            return 1
+        }
+        release_id=$(jq -er '.id | select(type == "number" and . > 0)' <<<"$release" 2>/dev/null) || {
+            echo "Latest release metadata has no valid release ID" >&2
+            return 1
+        }
+        latest=$(jq -er '.tag_name | select(type == "string" and length > 0)' <<<"$release" 2>/dev/null) || {
+            echo "Latest release metadata has no valid tag" >&2
+            return 1
+        }
+
+        release_has_snapshot_asset "$release" && return 0
+
         echo "Deleting the latest release..."
-        curl_gh -X DELETE "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/$(jq -r '.id' <<<"$release")"
-        release=$(query_api "repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest")
-        latest=$(jq -r '.tag_name' <<<"$release")
+        curl_gh_direct --fail-with-body --silent --show-error --output /dev/null -X DELETE "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/$release_id" || {
+            echo "Failed to delete latest release $latest" >&2
+            return 1
+        }
     done
 }
 
 docker_manifest_size() {
     local manifest=$1
+    local context=${2:-manifest}
+    local status=0
 
-    if [[ -n "$(jq '.. | try .layers[]' 2>/dev/null <<<"$manifest")" ]]; then
-        jq '.. | try .size | select(. > 0)' <<<"$manifest" | awk '{s+=$1} END {printf "%d",  s}'
-    elif [[ -n "$(jq '.. | try .manifests[]' 2>/dev/null <<<"$manifest")" ]]; then
-        jq '.. | try .size | select(. > 0)' <<<"$manifest" | awk '{s+=$1} END {printf "%d",  s/NR}'
-    else
+    [ -n "$manifest" ] || {
         echo -1
-    fi
+        return 0
+    }
+
+    bkg_python version manifest-size "$context" <<<"$manifest" || status=$?
+    ((status != 3)) || return 3
+    ((status == 0)) || echo -1
 }
 
 owner_get_id() {
-    local owner
-    local owner_id=""
-    owner=$(echo "$1" | tr -d '[:space:]')
-    [ -n "$owner" ] || return
+    local owner_ref
+    local status=0
 
-    if [[ "$owner" =~ .*\/.* ]]; then
-        owner_id=$(cut -d'/' -f1 <<<"$owner")
-        owner=$(cut -d'/' -f2 <<<"$owner")
-    fi
-
-    if [[ ! "$owner_id" =~ ^[1-9] ]]; then
-        owner_id=$(curl "https://github.com/$owner" | grep -zoP 'meta.*?u\/\d+' | tr -d '\0' | grep -oP 'u\/\d+' | sort -u | head -n1 | grep -oP '\d+')
-
-        if [[ ! "$owner_id" =~ ^[1-9] && -n "$GITHUB_TOKEN" ]]; then
-            owner_id=$(query_api "users/$owner")
-            (($? != 3)) || return 3
-            owner_id=$(jq -r '.id' <<<"$owner_id")
-
-            if [[ ! "$owner_id" =~ ^[1-9] ]]; then
-                owner_id=$(query_api "orgs/$owner")
-                (($? != 3)) || return 3
-                owner_id=$(jq -r '.id' <<<"$owner_id") || return 1
-            fi
-        fi
-    fi
-
-    echo "$owner_id/$owner"
+    owner_ref=$(bkg_python discovery resolve-owner "$1")
+    status=$?
+    ((status != 3)) || return 3
+    ((status == 0)) || return "$status"
+    [ -n "$owner_ref" ] || return "$BKG_OWNER_NOT_FOUND_STATUS"
+    printf '%s\n' "$owner_ref"
 }
 
 owner_has_packages() {
@@ -1481,6 +1351,10 @@ owner_has_packages() {
 
 get_owners() {
     sort -u <<<"$1" | while read -r owner; do owner_get_id "$owner"; done | grep -v '^\/'
+}
+
+print_nonempty_lines() {
+    [ -z "$1" ] || printf '%s\n' "$1"
 }
 
 curl_users() {
@@ -1499,7 +1373,20 @@ curl_orgs() {
     local orgs=""
     local status=0
 
+    [ -n "$target" ] || return 0
+
     if [ -n "${GITHUB_TOKEN:-}" ] && [[ "$target" != orgs/* ]] && [[ "$target" != *\?* ]] && [[ "$target" != */*/* ]]; then
+        if [ -n "$resolve_names" ]; then
+            orgs=$(bkg_python discovery orgs "$target" --resolve) || status=$?
+        else
+            orgs=$(bkg_python discovery orgs "$target") || status=$?
+        fi
+        ((status != 3)) || return 3
+        if ((status == 0)); then
+            print_nonempty_lines "$orgs"
+            return 0
+        fi
+
         owner_type=$(graphql_owner_type "$target")
         status=$?
         ((status != 3)) || return 3
@@ -1535,10 +1422,24 @@ explore() {
 	local is_user=false
 	local got_orgs=false
 	local status=0
+    local nodes=""
     local graphql_owner_type=""
 	[[ ! "$node" =~ .*\/.* ]] || is_repo=true
     [ "$is_repo" = true ] && local graph=("stargazers" "watchers" "forks" "collaborators") || local graph=("followers" "following" "people")
     [ -z "$2" ] || graph=("$2")
+
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+        if [ -n "${2:-}" ]; then
+            nodes=$(bkg_python discovery explore "$node" "$2") || status=$?
+        else
+            nodes=$(bkg_python discovery explore "$node") || status=$?
+        fi
+        ((status != 3)) || return 3
+        if ((status == 0)); then
+            print_nonempty_lines "$nodes"
+            return 0
+        fi
+    fi
 
     if [ "$is_repo" = false ] && [ -n "${GITHUB_TOKEN:-}" ]; then
         graphql_owner_type=$(graphql_owner_type "$node")
@@ -1550,7 +1451,7 @@ explore() {
         local page=1
         local cursor=""
         while true; do
-            local nodes
+            nodes=""
 
             if [ -n "${GITHUB_TOKEN:-}" ] && [ "$edge" != "collaborators" ]; then
                 if [ "$is_repo" = true ]; then
@@ -1637,6 +1538,13 @@ get_membership() {
     owner=$(cut -d'/' -f2 <<<"$1")
 
     if [ -n "${GITHUB_TOKEN:-}" ]; then
+        people=$(bkg_python discovery membership "$1") || status=$?
+        ((status != 3)) || return 3
+        if ((status == 0)); then
+            print_nonempty_lines "$people"
+            return 0
+        fi
+
         owner_type=$(graphql_owner_type "$owner")
         status=$?
         ((status != 3)) || return 3
@@ -1669,12 +1577,7 @@ get_membership() {
 }
 
 ytox() {
-	echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?><xml>$(yq -ox -I0 "$1" | sed 's/"/\\"/g')</xml>" >"${1%.*}.xml" 2>/dev/null
-	stat -c %s "${1%.*}.xml" || echo -1
-}
-
-ytoy() {
-    yq -oy "$1" | sed 's/"/\\"/g' >"${1%.*}.yml"
+    bkg_python json-to-xml "$1"
 }
 
 clean_owners() {

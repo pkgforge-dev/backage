@@ -106,9 +106,9 @@ run_owner_updates() {
 		) &
 		updates_pid=$!
 
-		while kill -0 "$updates_pid" 2>/dev/null; do
-			sleep 30
-			kill -0 "$updates_pid" 2>/dev/null || break
+		while background_job_running "$updates_pid"; do
+			sleep 1
+			background_job_running "$updates_pid" || break
 			script_stop_requested || continue
 			owner_update_wait_notice "$stop_wait_started" "$last_wait_notice"
 			stop_wait_started=$OWNER_UPDATE_WAIT_STARTED
@@ -135,6 +135,23 @@ run_owner_updates() {
 	fi
 
 	return "$status"
+}
+
+handle_owner_update_status() {
+	local phase_status=${1:-0}
+
+	if ((phase_status == 3)); then
+		return_code=3
+		echo "Reached BKG_MAX_LEN, stopping after persisting state..."
+		return 0
+	fi
+
+	if ((phase_status != 0)); then
+		echo "Owner updates failed with status $phase_status; stopping before snapshot publication." >&2
+		return "$phase_status"
+	fi
+
+	return 0
 }
 
 run_owner_page_discovery() {
@@ -181,184 +198,122 @@ log_prequeue_elapsed_once() {
 	log_startup_phase "pre-queue-work" "${BKG_STARTUP_STARTED_AT:-0}"
 }
 
+batch_should_reset() {
+	local remaining=${1:-0}
+
+	((remaining == 0))
+}
+
 db_restore_signature_file() {
 	printf '%s\n' "${BKG_INDEX_DB}.snapshot.sha256"
 }
 
 current_index_snapshot_archive_file() {
-	local db_archive_file=""
-	local legacy_archive_file=""
+	bkg_python snapshot current-archive
+}
 
-	db_archive_file=$(db_snapshot_archive_file 2>/dev/null || :)
-	if [ -n "$db_archive_file" ] && [ -f "$db_archive_file" ]; then
-		printf '%s\n' "$db_archive_file"
+post_stop_bkg_python() {
+	local previous_timeout
+	local previous_max_len=$BKG_MAX_LEN
+	local status=0
+
+	previous_timeout=$(get_BKG BKG_TIMEOUT)
+	set_BKG BKG_TIMEOUT "0"
+	BKG_MAX_LEN=0 bkg_python "$@" || status=$?
+	BKG_MAX_LEN=$previous_max_len
+
+	if ((status == 3)); then
+		set_BKG BKG_TIMEOUT "1"
+	elif [ -n "$previous_timeout" ]; then
+		set_BKG BKG_TIMEOUT "$previous_timeout"
+	else
+		del_BKG BKG_TIMEOUT
+	fi
+	return "$status"
+}
+
+post_stop_current_index_snapshot_archive_file() {
+	post_stop_bkg_python snapshot current-archive
+}
+
+post_stop_ytox() {
+	[ -n "$1" ] || return 1
+	post_stop_bkg_python json-to-xml "$1" >/dev/null
+}
+
+startup_index_snapshot_archive_file() {
+	local snapshot_file
+
+	snapshot_file=$(current_index_snapshot_archive_file 2>/dev/null || :)
+	if [ -n "$snapshot_file" ]; then
+		printf '%s\n' "$snapshot_file"
 		return 0
 	fi
 
-	db_archive_file=$(legacy_db_snapshot_archive_file 2>/dev/null || :)
-	if [ -n "$db_archive_file" ] && [ -f "$db_archive_file" ]; then
-		printf '%s\n' "$db_archive_file"
-		return 0
-	fi
-
-	legacy_archive_file=$(legacy_sql_snapshot_archive_file 2>/dev/null || :)
-	if [ -n "$legacy_archive_file" ] && [ -f "$legacy_archive_file" ]; then
-		printf '%s\n' "$legacy_archive_file"
-		return 0
-	fi
-
-	return 1
+	[ -n "${BKG_INDEX_DB:-}" ] || return 1
+	snapshot_file="$(dirname "$BKG_INDEX_DB")/.snapshot/$(basename "$BKG_INDEX_DB")"
+	[ -f "$snapshot_file" ] || return 1
+	printf '%s\n' "$snapshot_file"
 }
 
 current_index_snapshot_signature() {
-	local archive_file
-	archive_file=$(current_index_snapshot_archive_file) || return 1
-	sha256sum "$archive_file" | awk '{print $1}'
+	bkg_python snapshot current-signature
 }
 
 restore_db_from_index_snapshot_if_needed() {
-	local archive_file
-	local archive_name
-	local archive_kind
-	local signature_file
-	local current_signature
-	local stored_signature=""
-	local db_tmp=""
+	bkg_python snapshot restore-if-needed
+}
 
-	archive_file=$(current_index_snapshot_archive_file) || return 0
-	archive_name=$(basename "$archive_file")
-	case "$archive_file" in
-		*.db) archive_kind="db" ;;
-		*.db.zst) archive_kind="db" ;;
-		*) archive_kind="sql" ;;
-	esac
+restore_startup_database_snapshot_if_needed() {
+	local snapshot_file=${1:-}
+	local output
+	local status=0
 
-	signature_file=$(db_restore_signature_file)
-	current_signature=$(sha256sum "$archive_file" | awk '{print $1}')
-	[ -f "$signature_file" ] && stored_signature=$(cat "$signature_file")
-
-	if [ -s "$BKG_INDEX_DB" ] && [ -n "$stored_signature" ] && [ "$stored_signature" = "$current_signature" ]; then
-		echo "Using existing database; $archive_name unchanged"
-		return 0
+	[ -n "$snapshot_file" ] || return 0
+	set_BKG BKG_SCRIPT_START "$(date -u +%s)"
+	set_BKG BKG_TIMEOUT "0"
+	output=$(bkg_python snapshot restore-archive-if-needed "$snapshot_file" 2>&1) || status=$?
+	[ -z "$output" ] || printf '%s\n' "$output"
+	if ((status != 0)) && [ -z "$output" ]; then
+		echo "Snapshot restore command failed with status $status for $snapshot_file" >&2
 	fi
+	return "$status"
+}
 
-	[ ! -f "$BKG_INDEX_DB" ] || mv "$BKG_INDEX_DB" "$BKG_INDEX_DB".bak
-
-	if [ "$archive_kind" = "db" ]; then
-		echo "Restoring database from $archive_name..."
-		db_tmp=$(mktemp "$(dirname "$BKG_INDEX_DB")/.${BKG_INDEX_DB##*/}.XXXXXX") || return 1
-		if { [[ "$archive_file" = *.zst ]] && unzstd -c "$archive_file" >"$db_tmp"; } || { [[ "$archive_file" != *.zst ]] && cp -f "$archive_file" "$db_tmp"; }; then
-			mv -f "$db_tmp" "$BKG_INDEX_DB"
-		else
-			rm -f "$db_tmp"
-		fi
-	else
-		echo "Restoring database from legacy $archive_name..."
-		if unzstd -c "$archive_file" | command sqlite3 "$BKG_INDEX_DB"; then
-			true
-		fi
-	fi
-
-	if [ -f "$BKG_INDEX_DB" ]; then
-		printf '%s\n' "$current_signature" >"$signature_file"
-		[ ! -f "$BKG_INDEX_DB".bak ] || rm -f "$BKG_INDEX_DB".bak
-		return 0
-	fi
-
-	[ ! -f "$BKG_INDEX_DB" ] || rm -f "$BKG_INDEX_DB"
-	[ ! -f "$BKG_INDEX_DB".bak ] || mv "$BKG_INDEX_DB".bak "$BKG_INDEX_DB"
-	return 1
+index_database_owner_count() {
+	sqlite3 "$BKG_INDEX_DB" "SELECT COUNT(DISTINCT owner) FROM $BKG_INDEX_TBL_PKG" 2>/dev/null || echo 0
 }
 
 write_db_restore_signature() {
-	local current_signature
-	current_signature=$(current_index_snapshot_signature) || return 0
-	printf '%s\n' "$current_signature" >"$(db_restore_signature_file)"
+	bkg_python snapshot write-restore-signature >/dev/null || :
 }
 
 checkpoint_database_for_archive() {
-	command sqlite3 "$BKG_INDEX_DB" 'pragma wal_checkpoint(truncate);' >/dev/null 2>&1 || sqlite3 "$BKG_INDEX_DB" 'pragma wal_checkpoint(truncate);' >/dev/null 2>&1 || :
+	post_stop_bkg_python snapshot checkpoint >/dev/null || :
+}
+
+prepare_database_snapshot_for_archive() {
+	post_stop_bkg_python snapshot prepare >/dev/null
+}
+
+rotate_database_snapshot_if_needed() {
+	local threshold_bytes=${1:-2000000000}
+	local batch_first_started=${2:-}
+	local date_stamp=${3:-}
+
+	[ -n "$batch_first_started" ] || batch_first_started=$(current_batch_first_started)
+	[ -n "$batch_first_started" ] || batch_first_started="0000-00-00"
+	[ -n "$date_stamp" ] || date_stamp=$(date -u +%Y.%m.%d)
+	post_stop_bkg_python snapshot rotate-if-needed "$threshold_bytes" "$batch_first_started" "$date_stamp" >/dev/null
 }
 
 drop_replaced_legacy_version_tables() {
 	local batch_first_started=${1:-}
-	local batch_first_started_sql
-	local package_ref
-	local legacy_current_count
-	local missing_replacement_count
-	local owner_id_key
-	local owner_type_key
-	local package_type_key
-	local owner_key
-	local repo_key
-	local package_key
-	local legacy_table_sql
-	local versions_table_sql
-	local packages_table_sql
-	local legacy_prefix_sql
-	local table_name
 
 	[ -n "${BKG_INDEX_DB:-}" ] || return 0
 	[ -n "$batch_first_started" ] || batch_first_started=$(current_batch_first_started)
 	[ -n "$batch_first_started" ] || batch_first_started="0000-00-00"
-
-	batch_first_started_sql=$(sqlite_quote_literal "$batch_first_started")
-	versions_table_sql=$(sqlite_quote_identifier "$BKG_INDEX_TBL_VER")
-	packages_table_sql=$(sqlite_quote_identifier "$BKG_INDEX_TBL_PKG")
-	legacy_prefix_sql=$(sqlite_quote_literal "${BKG_INDEX_TBL_VER}_")
-
-	while IFS= read -r table_name; do
-		[ -n "$table_name" ] || continue
-		[ "$table_name" != "$BKG_INDEX_TBL_VER" ] || continue
-		legacy_table_sql=$(sqlite_quote_identifier "$table_name")
-
-		sqlite3 "$BKG_INDEX_DB" "delete from $legacy_table_sql where date < $batch_first_started_sql;" >/dev/null || continue
-		legacy_current_count=$(sqlite3 "$BKG_INDEX_DB" "select count(*) from $legacy_table_sql where date >= $batch_first_started_sql;" 2>/dev/null || :)
-		[[ "$legacy_current_count" =~ ^[0-9]+$ ]] || continue
-
-		if ((legacy_current_count == 0)); then
-			sqlite3 "$BKG_INDEX_DB" "drop table if exists $legacy_table_sql;" >/dev/null || :
-			continue
-		fi
-
-		package_ref=$(sqlite3 "$BKG_INDEX_DB" "
-			select owner_id, owner_type, package_type, owner, repo, package
-			from $packages_table_sql
-			where date >= $batch_first_started_sql
-			  and ($legacy_prefix_sql || owner_type || '_' || package_type || '_' || owner || '_' || repo || '_' || package) = $(sqlite_quote_literal "$table_name")
-			order by date desc
-			limit 1;
-		" 2>/dev/null || :)
-
-		if [ -z "$package_ref" ]; then
-			sqlite3 "$BKG_INDEX_DB" "drop table if exists $legacy_table_sql;" >/dev/null || :
-			continue
-		fi
-
-		IFS='|' read -r owner_id_key owner_type_key package_type_key owner_key repo_key package_key <<<"$package_ref"
-		missing_replacement_count=$(sqlite3 "$BKG_INDEX_DB" "
-			select count(*)
-			from $legacy_table_sql legacy
-			where legacy.date >= $batch_first_started_sql
-			  and not exists (
-				select 1
-				from $versions_table_sql normalized
-				where normalized.owner_id = $(sqlite_quote_literal "$owner_id_key")
-				  and normalized.owner_type = $(sqlite_quote_literal "$owner_type_key")
-				  and normalized.package_type = $(sqlite_quote_literal "$package_type_key")
-				  and normalized.owner = $(sqlite_quote_literal "$owner_key")
-				  and normalized.repo = $(sqlite_quote_literal "$repo_key")
-				  and normalized.package = $(sqlite_quote_literal "$package_key")
-				  and normalized.id = legacy.id
-				  and normalized.date = legacy.date
-			  );
-		" 2>/dev/null || :)
-		[[ "$missing_replacement_count" =~ ^[0-9]+$ ]] || continue
-
-		if ((missing_replacement_count == 0)); then
-			sqlite3 "$BKG_INDEX_DB" "drop table if exists $legacy_table_sql;" >/dev/null || :
-		fi
-	done < <(sqlite3 "$BKG_INDEX_DB" "select name from sqlite_master where type='table' and name like $(sqlite_quote_literal "${BKG_INDEX_TBL_VER}_%") order by name;" 2>/dev/null || :)
+	bkg_python database cleanup-legacy-all "$batch_first_started" >/dev/null
 }
 
 main() {
@@ -381,7 +336,6 @@ main() {
 	local phase_started_at=0
 	local owners_table_sql
 	local packages_table_sql
-	local versions_table_sql
 	local batch_first_started_sql
 	connections=$(mktemp) || exit 1
 	temp_connections=$(mktemp) || exit 1
@@ -446,11 +400,41 @@ main() {
 	sqlite_ensure_index_schema || return $?
 	owners_table_sql=$(sqlite_quote_identifier "$BKG_INDEX_TBL_OWN")
 	packages_table_sql=$(sqlite_quote_identifier "$BKG_INDEX_TBL_PKG")
-	versions_table_sql=$(sqlite_quote_identifier "$BKG_INDEX_TBL_VER")
 	batch_first_started_sql=$(sqlite_quote_literal "$BKG_BATCH_FIRST_STARTED")
-	sqlite3 "$BKG_INDEX_DB" "select owner_id, owner, repo, package, max(date) as max_date from $packages_table_sql group by owner_id, owner, repo, package having max(date) >= $batch_first_started_sql order by max_date asc;" >packages_already_updated
+	sqlite3 "$BKG_INDEX_DB" "
+		select current.owner_id, current.owner, current.repo, current.package,
+		       max(current.date) as max_date
+		from $packages_table_sql current
+		where not exists (
+			select 1
+			from bkg_package_publications pending
+			where pending.owner_id = current.owner_id
+			  and pending.owner_type = current.owner_type
+			  and pending.package_type = current.package_type
+			  and pending.owner = current.owner
+			  and pending.repo = current.repo
+			  and pending.package = current.package
+		)
+		group by current.owner_id, current.owner, current.repo, current.package
+		having max(current.date) >= $batch_first_started_sql
+		order by max_date asc;
+	" >packages_already_updated
 	sqlite3 "$BKG_INDEX_DB" "select owner_id, owner, repo, package, max(date) as max_date from $packages_table_sql group by owner_id, owner, repo, package order by date asc;" >packages_all
-	sqlite3 "$BKG_INDEX_DB" "select owner_id, owner, max(date) as max_date from $packages_table_sql group by owner_id, owner order by date asc;" | awk -F'|' '{print $2}' >all_owners_in_db
+	sqlite3 "$BKG_INDEX_DB" "
+		select owner
+		from (
+			select owner, min(date) as first_date
+			from $packages_table_sql
+			group by owner
+			union all
+			select owner, min(date) as first_date
+			from $owners_table_sql
+			where date >= $batch_first_started_sql
+			group by owner
+		)
+		group by owner
+		order by min(first_date), owner;
+	" >all_owners_in_db
 	grep -vFxf packages_already_updated packages_all >packages_to_update
 	pkg_done=$(wc -l <packages_already_updated)
 	pkg_left=$(wc -l <packages_to_update)
@@ -487,12 +471,14 @@ main() {
 						phase_status=$?
 						((phase_status != 3)) || return_code=3
 						log_startup_phase "discover-connections" "$phase_started_at"
+						clean_owners "$connections"
 
 						if ((return_code != 3)); then
 
 							# get orgs of connections
 							phase_started_at=$(startup_phase_started_at)
 							while read -r connection; do
+								[ -n "$connection" ] || continue
 								curl_orgs "$connection" >>"$temp_connections"
 								phase_status=$?
 								if ((phase_status == 3)); then
@@ -501,11 +487,12 @@ main() {
 								fi
 							done <"$connections"
 							cat "$temp_connections" >>"$connections"
+							clean_owners "$connections"
 							log_startup_phase "expand-connection-orgs" "$phase_started_at"
 						fi
 					fi
 
-					sed -i 's/^[[:space:]]*//;s/[[:space:]]*$//; /^$/d; /^0\/$/d' "$connections"
+					clean_owners "$connections"
 					if ! daily_gate_completed_today BKG_LAST_EXPLORE_DATE "$today" && ((return_code != 3)); then
 						mark_daily_gate_completed BKG_LAST_EXPLORE_DATE "$today"
 					fi
@@ -534,7 +521,7 @@ main() {
 				if ((return_code == 3)); then
 					echo "Reached BKG_MAX_LEN, stopping after persisting state..."
 				else
-				if (( 9999 < pkg_done )) || (( pkg_left < 4 )) || [[ "${db_size_curr::-4}" == "${db_size_prev::-4}" ]]; then
+				if batch_should_reset "$pkg_left"; then
 					# reset the batch
 					BKG_BATCH_FIRST_STARTED=$today
 					set_BKG BKG_BATCH_FIRST_STARTED "$today"
@@ -542,13 +529,17 @@ main() {
 					rm -f packages_to_update
 					\cp packages_all packages_to_update
 					: >packages_already_updated
-					[ "${db_size_curr::-4}" != "${db_size_prev::-4}" ] || echo "Database size unchanged! Previous: $db_size_prev; Current: $db_size_curr"
 				fi
 
 				awk -F'|' '{print $2}' packages_already_updated | awk '!seen[$0]++' >owners_updated
 				awk -F'|' '{print $2}' packages_to_update | awk '!seen[$0]++' >all_owners_tu
 				grep -Fxf owners_updated all_owners_tu >owners_partially_updated
 				grep -vFxf owners_updated all_owners_tu >owners_stale
+				bkg_python database deferred-owners "$(date -u +%s)" >owners_deferred || return $?
+				while IFS=$'\t' read -r deferred_owner retry_after; do
+					[ -n "$deferred_owner" ] || continue
+					echo "Deferred $deferred_owner until $(date -u -d "@$retry_after" +%Y-%m-%dT%H:%M:%SZ)"
+				done <owners_deferred
 				sort "$connections" | uniq -c | sort -nr | awk '{print $2}' >"$connections".bak
 				mv "$connections".bak "$connections"
 				batch_first_started_sql=$(sqlite_quote_literal "$BKG_BATCH_FIRST_STARTED")
@@ -573,12 +564,25 @@ main() {
 					rm -f "$owner_candidates_file"
 					return 1
 				}
-				bash lib/get.sh "$rest_first" "$connections" $request_limit "$GITHUB_OWNER" "$owners_queue_source" "$BKG_INDEX_DIR" >"$owner_candidates_file"
+				local missing_owners_file
+				missing_owners_file=$(mktemp) || {
+					rm -f "$owner_candidates_file" "$owner_ids_file"
+					return 1
+				}
+				local owner_reasons_file
+				owner_reasons_file=$(mktemp) || {
+					rm -f "$owner_candidates_file" "$owner_ids_file" "$missing_owners_file"
+					return 1
+				}
+				export BKG_OWNER_QUEUE_REASONS_FILE=$owner_reasons_file
+				# BKG_INDEX_DIR is initialized by the update.sh entrypoint.
+				# shellcheck disable=SC2153
+				bash lib/get.sh "$rest_first" "$connections" $request_limit "$GITHUB_OWNER" "$owners_queue_source" "$BKG_INDEX_DIR" "$owner_reasons_file" >"$owner_candidates_file"
 				phase_status=$?
 				((phase_status != 3)) || return_code=3
 				if ((return_code != 3)); then
 					if [ -s "$owner_candidates_file" ]; then
-						resolve_owner_ids "$owner_candidates_file" >"$owner_ids_file"
+						resolve_owner_ids "$owner_candidates_file" "$missing_owners_file" >"$owner_ids_file"
 					else
 						: >"$owner_ids_file"
 					fi
@@ -597,13 +601,27 @@ main() {
 					phase_status=$?
 					((phase_status != 3)) || return_code=3
 				fi
+				if ((return_code != 3)) && [ -s "$missing_owners_file" ]; then
+					while IFS= read -r owner_name; do
+						[ -n "$owner_name" ] || continue
+						retire_missing_owner "$owner_name" || {
+							phase_status=$?
+							((phase_status != 3)) || return_code=3
+							((phase_status == 3)) || return "$phase_status"
+							break
+						}
+					done < <(sort -u "$missing_owners_file")
+				fi
 				rm -f "$owner_candidates_file"
 				rm -f "$owner_ids_file"
+				rm -f "$missing_owners_file"
+				rm -f "$owner_reasons_file"
+				unset BKG_OWNER_QUEUE_REASONS_FILE
 				if [ "$owners_queue_source" != "/dev/null" ] && ((return_code != 3)); then
 					mark_daily_gate_completed BKG_LAST_OWNERS_QUEUE_DATE "$today"
 				fi
 				log_startup_phase "queue-discovered-owners" "$phase_started_at"
-				rm -f all_owners_in_db all_owners_tu owners_updated owners_partially_updated owners_stale owners_scanned_without_packages
+				rm -f all_owners_in_db all_owners_tu owners_updated owners_partially_updated owners_stale owners_deferred owners_scanned_without_packages
 				set_BKG BKG_DIFF "$db_size_curr"
 				set_BKG BKG_REST_TO_TOP "$((1 - rest_first))"
 				fi
@@ -645,51 +663,23 @@ main() {
 
 			run_owner_updates
 			phase_status=$?
-			if ((phase_status == 3)); then
-				return_code=3
-				echo "Reached BKG_MAX_LEN, stopping after persisting state..."
-			fi
+			handle_owner_update_status "$phase_status" || return $?
 		fi
 
 		set_BKG BKG_OUT "$(wc -l <"$BKG_OPTOUT")"
 		sqlite3 "$BKG_INDEX_DB" "select owner_id, owner, repo, package from $packages_table_sql;" | sort -u >packages_all
 		echo "Preparing the database snapshot..."
 		checkpoint_database_for_archive
-		db_archive_file=$(db_snapshot_archive_file)
-		db_archive_tmp="$db_archive_file.new"
-		mkdir -p "$(dirname "$db_archive_file")"
-		cp -f "$BKG_INDEX_DB" "$db_archive_tmp"
 
-		if [ -f "$db_archive_tmp" ]; then
-			# rotate the database if it's greater than 2GB
-			if [ "$(stat -c %s "$db_archive_tmp")" -ge 2000000000 ]; then
-				rotated=true
-				echo "Rotating the database..."
-				local older_db
-				older_db="$(dirname "$db_archive_file")/$(date -u +%Y.%m.%d).$(basename "$db_archive_file").zst"
-				if [ -f "$db_archive_file" ]; then
-					[ ! -f "$older_db" ] || rm -f "$older_db"
-					zstd -22 --ultra --long -T0 "$db_archive_file" -o "$older_db"
-					rm -f "$db_archive_file"
-				fi
-				batch_first_started_sql=$(sqlite_quote_literal "$BKG_BATCH_FIRST_STARTED")
-				sqlite3 "$BKG_INDEX_DB" "delete from $packages_table_sql where date < $batch_first_started_sql;"
-				sqlite3 "$BKG_INDEX_DB" "delete from $versions_table_sql where date < $batch_first_started_sql;"
-				drop_replaced_legacy_version_tables "$BKG_BATCH_FIRST_STARTED"
-				sqlite3 "$BKG_INDEX_DB" "vacuum;"
-				checkpoint_database_for_archive
-				rm -f "$db_archive_tmp"
-				cp -f "$BKG_INDEX_DB" "$db_archive_tmp"
-				echo "Rotated the database"
-			fi
+		# rotate the database if it's greater than 2GB
+		if [ "$(stat -c %s "$BKG_INDEX_DB" 2>/dev/null || echo 0)" -ge 2000000000 ]; then
+			rotated=true
+			echo "Rotating the database..."
+			rotate_database_snapshot_if_needed 2000000000 "$BKG_BATCH_FIRST_STARTED"
+			echo "Rotated the database"
+		fi
 
-			mv "$db_archive_tmp" "$db_archive_file"
-			legacy_db_archive_file=$(legacy_db_snapshot_archive_file 2>/dev/null || :)
-			[ -z "$legacy_db_archive_file" ] || rm -f "$legacy_db_archive_file"
-			legacy_archive_file=$(legacy_sql_snapshot_archive_file 2>/dev/null || :)
-			[ -z "$legacy_archive_file" ] || rm -f "$legacy_archive_file"
-			write_db_restore_signature
-			chmod 666 "$db_archive_file"
+		if prepare_database_snapshot_for_archive; then
 			echo "Prepared the database snapshot"
 		else
 			echo "Failed to prepare the database snapshot!"
@@ -708,7 +698,7 @@ main() {
 	[ ! -f "$BKG_ROOT"/README.md ] || rm -f "$BKG_ROOT"/README.md
 	\cp templates/.README.md "$BKG_ROOT"/README.md
 	sed -i 's/<GITHUB_OWNER>/'"$GITHUB_OWNER"'/g; s/<GITHUB_REPO>/'"$GITHUB_REPO"'/g; s/<GITHUB_BRANCH>/'"$GITHUB_BRANCH"'/g; s/\[PACKAGES\]/'"$packages"'/g; s/\[DATE\]/'"$today"'/g' "$BKG_ROOT"/README.md
-	sed -i '/^BKG_VERSIONS_.*=/d; /^BKG_PACKAGES_.*=/d; /^BKG_OWNERS_.*=/d; /^BKG_TIMEOUT=/d' "$BKG_ENV"
+		sed -i '/^BKG_VERSIONS_.*=/d; /^BKG_PACKAGES_.*=/d; /^BKG_OWNERS_.*=/d; /^BKG_PAGE_[0-9].*=/d; /^BKG_OWNER_SCAN_.*=/d; /^BKG_TIMEOUT=/d' "$BKG_ENV"
 	\cp "$BKG_ROOT"/README.md "$BKG_INDEX_DIR"/README.md
 	# shellcheck disable=SC2016
 	sed -i 's/src\/img\/logo-b.webp/logo-b.webp/g; s/```py/```prolog/g; s/```js/```jboss-cli/g' "$BKG_INDEX_DIR"/README.md
@@ -727,7 +717,7 @@ main() {
         \"raw_packages\":$packages,
         \"date\":\"$today\"
     }" | tr -d '\n' | jq -c . >"$BKG_INDEX_DIR"/.json
-	ytox "$BKG_INDEX_DIR"/.json
+	post_stop_ytox "$BKG_INDEX_DIR"/.json || return $?
 	echo "Done!"
 	return $return_code
 }
