@@ -21,53 +21,15 @@ from bkg_py.workspace import (
 )
 from bkg_py.workspace.repository import ensure_pages_root
 
-
-def _git(repository: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    git = shutil.which("git")
-    assert git is not None
-    return subprocess.run(  # noqa: S603
-        (git, "-C", str(repository), *arguments),
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-
-def _create_repository(path: Path) -> None:
-    path.mkdir()
-    git = shutil.which("git")
-    assert git is not None
-    subprocess.run(  # noqa: S603
-        (git, "init", "-q", "-b", "master", str(path)),
-        check=True,
-    )
-    _git(path, "config", "user.name", "test")
-    _git(path, "config", "user.email", "test@example.com")
-    (path / "alpha" / "repo-a").mkdir(parents=True)
-    (path / "beta" / "repo-b").mkdir(parents=True)
-    (path / ".env").write_text("state\n", encoding="utf-8")
-    (path / "README.md").write_text("index\n", encoding="utf-8")
-    (path / "alpha" / "repo-a" / "package.json").write_text(
-        "{}\n",
-        encoding="utf-8",
-    )
-    (path / "beta" / "repo-b" / "package.json").write_text(
-        "{}\n",
-        encoding="utf-8",
-    )
-    _git(path, "add", "-A")
-    _git(path, "commit", "-qm", "init")
-
-
-def _create_repository_with_remote(tmp_path: Path) -> tuple[Path, Path]:
-    remote = tmp_path / "remote.git"
-    remote.mkdir()
-    _git(remote, "init", "--bare", "-q", "--initial-branch=master")
-    repository = tmp_path / "repository"
-    _create_repository(repository)
-    _git(repository, "remote", "add", "origin", str(remote))
-    _git(repository, "push", "-qu", "origin", "master")
-    return repository, remote
+from .repository_support import (
+    create_repository as _create_repository,
+)
+from .repository_support import (
+    create_repository_with_remote as _create_repository_with_remote,
+)
+from .repository_support import (
+    git as _git,
+)
 
 
 def _create_publication_workspace(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
@@ -229,9 +191,48 @@ def test_sparse_repository_keeps_root_and_materializes_selected_owners(
     assert not (path / "beta").exists()
     assert repository.top_level_directory_count() == 2
 
-    repository.add_sparse_paths(("alpha", "beta"))
+    repository.materialize_sparse_paths(("alpha", "beta"))
 
     assert (path / "alpha" / "repo-a" / "package.json").is_file()
+    assert (path / "beta" / "repo-b" / "package.json").is_file()
+
+
+def test_sparse_repository_stages_completed_paths_before_replacing_them(
+    tmp_path: Path,
+) -> None:
+    """Only the active owner wave stays hydrated without losing prior changes."""
+
+    path = tmp_path / "index"
+    _create_repository(path)
+    repository = GitRepository(path)
+    repository.set_sparse_root()
+    repository.materialize_sparse_paths(("alpha",), replace=True)
+    package = path / "alpha" / "repo-a" / "package.json"
+    package.write_text('{"updated":true}\n', encoding="utf-8")
+
+    repository.materialize_sparse_paths(("beta",), replace=True)
+
+    assert not (path / "alpha").exists()
+    assert (path / "beta" / "repo-b" / "package.json").is_file()
+    assert _git(path, "diff", "--cached", "--name-only").stdout.splitlines() == [
+        "alpha/repo-a/package.json"
+    ]
+
+
+def test_sparse_repository_ignores_an_absent_path_when_replacing_it(
+    tmp_path: Path,
+) -> None:
+    """A queued owner without an index tree does not block the next sparse wave."""
+
+    path = tmp_path / "index"
+    _create_repository(path)
+    repository = GitRepository(path)
+    repository.set_sparse_root()
+    repository.materialize_sparse_paths(("missing-owner",), replace=True)
+
+    repository.materialize_sparse_paths(("beta",), replace=True)
+
+    assert not (path / "missing-owner").exists()
     assert (path / "beta" / "repo-b" / "package.json").is_file()
 
 
@@ -242,7 +243,8 @@ def test_sparse_operations_ignore_non_repository_path(tmp_path: Path) -> None:
 
     assert not repository.is_worktree()
     repository.set_sparse_root()
-    repository.add_sparse_paths(("alpha",))
+    repository.materialize_sparse_paths(("alpha",))
+    repository.materialize_sparse_paths(("alpha",), replace=True)
     assert repository.top_level_directory_count() == 0
 
 
@@ -435,7 +437,7 @@ def test_update_publication_keeps_branch_ownership_and_skips_no_op_commits(
     """Generated index state and selected source files reach only their branches."""
 
     repository, remote, index_dir, state_file = _create_publication_workspace(tmp_path)
-    GitRepository(index_dir).add_sparse_paths(("gamma",))
+    GitRepository(index_dir).materialize_sparse_paths(("gamma",))
     generated = index_dir / "gamma" / "repo" / "package.json"
     generated.parent.mkdir(parents=True)
     generated.write_text("{}\n", encoding="utf-8")
@@ -493,7 +495,7 @@ def test_update_publication_retains_index_commit_when_push_fails(
     """A failed push leaves the completed index commit and worktree available."""
 
     repository, _remote, index_dir, state_file = _create_publication_workspace(tmp_path)
-    GitRepository(index_dir).add_sparse_paths(("gamma",))
+    GitRepository(index_dir).materialize_sparse_paths(("gamma",))
     generated = index_dir / "gamma" / "repo" / "package.json"
     generated.parent.mkdir(parents=True)
     generated.write_text("{}\n", encoding="utf-8")
