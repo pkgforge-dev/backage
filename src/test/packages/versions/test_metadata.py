@@ -5,8 +5,7 @@ from __future__ import annotations
 import base64
 import json
 
-from bkg_py.version_selection import VersionCandidate
-from bkg_py.versions import (
+from bkg_py.packages.versions.metadata import (
     DownloadMetrics,
     VersionListEntry,
     VersionListingContext,
@@ -21,6 +20,7 @@ from bkg_py.versions import (
     version_cache_records,
     version_candidates,
 )
+from bkg_py.packages.versions.selection import VersionCandidate
 
 
 def test_parse_metric_value_matches_shell_metric_units() -> None:
@@ -51,6 +51,17 @@ def test_extract_download_metrics_from_version_page_spans() -> None:
         day=6,
     )
     assert extract_download_metric(html, "Missing") == -1
+
+
+def test_extract_download_metric_from_package_total_heading() -> None:
+    """Package detail pages expose the exact total in a heading title."""
+
+    html = """
+    <span class="d-block color-fg-muted text-small">Total downloads</span>
+    <h3 title="96901">96.9K</h3>
+    """
+
+    assert extract_download_metric(html, "Total downloads") == 96_901
 
 
 def test_parse_version_listing_html_matches_github_rows() -> None:
