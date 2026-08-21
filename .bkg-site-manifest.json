@@ -3,14 +3,19 @@
   "entrypoint": "index.html",
   "files": [
     {
-      "bytes": 16582,
-      "path": ".bkg-site/assets/index.astro_astro_type_script_index_0_lang.Da25Qhca.js",
-      "sha256": "024031e3abbec63b88386d0257956d28a79711d8b2fd321960d20b84c3a8613b"
+      "bytes": 33430,
+      "path": ".bkg-site/assets/SiteShell.astro_astro_type_script_index_0_lang.BOnCMhfz.js",
+      "sha256": "a487443df2693241737f74911c72d0fcb849e46a135f85920e38bd4bfd7f3c01"
     },
     {
-      "bytes": 14211,
+      "bytes": 138556,
+      "path": ".bkg-site/assets/history-chart.DFfGVAYU.js",
+      "sha256": "2fcd0840fff76949813e452258ca9e67586c87e5dc4c1226d235e772faea7c9b"
+    },
+    {
+      "bytes": 79897,
       "path": "index.html",
-      "sha256": "61f45bae23e48159b76b1a862ff3ae2662c548e14f1c6a1717aa43da11f1433c"
+      "sha256": "7c004f9d99d00b3036faa62d769b5db61dcc014d865de9f44e39f3163706dec2"
     }
   ],
   "schema_version": 1,
